@@ -1,8 +1,10 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  allowedDevOrigins: ["homelab"],
   output: "standalone",
+  outputFileTracingExcludes: {
+    "/*": [".data/**/*"],
+  },
   turbopack: {
     root: process.cwd(),
   },
