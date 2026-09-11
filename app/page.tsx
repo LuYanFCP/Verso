@@ -1091,6 +1091,7 @@ type PageSpreadProps = {
   loading: boolean;
   error?: string;
   pageImageUrl?: string;
+  pdfReady: boolean;
   renderPageToCanvas: (page: number, canvas: HTMLCanvasElement, signal: AbortSignal) => Promise<void>;
   requestTranslation: (page: number, force?: boolean, cacheOnly?: boolean) => void;
   onTranslationAnimationComplete: (page: number, cacheVersion?: number) => void;
@@ -1113,6 +1114,7 @@ function PageSpread({
   loading,
   error,
   pageImageUrl,
+  pdfReady,
   renderPageToCanvas,
   requestTranslation,
   onTranslationAnimationComplete,
@@ -1184,7 +1186,8 @@ function PageSpread({
   }, [isDemo, near, workDistance, workEnabled]);
 
   useEffect(() => {
-    if (isDemo || !sourceActive || (pageImageUrl && !serverImageFailed)) return;
+    // Resume deferred canvas work after scrolling without redrawing a ready scan.
+    if (isDemo || !sourceActive || !workEnabled || !pdfReady || sourceReady || (pageImageUrl && !serverImageFailed)) return;
     const canvas = canvasRef.current;
     if (!canvas) return;
 
@@ -1204,7 +1207,7 @@ function PageSpread({
         setRenderError(error instanceof Error ? error.message : "Unknown page rendering error");
       });
     return () => controller.abort();
-  }, [isDemo, page, pageImageUrl, renderAttempt, renderPageToCanvas, serverImageFailed, sourceActive]);
+  }, [isDemo, page, pageImageUrl, pdfReady, renderAttempt, renderPageToCanvas, serverImageFailed, sourceActive, sourceReady, workEnabled]);
 
   useEffect(() => {
     const node = ref.current;
@@ -1935,6 +1938,7 @@ export default function Home() {
   const searchInput = useRef<HTMLInputElement>(null);
   const readerMenu = useRef<HTMLDivElement>(null);
   const pdfRef = useRef<PdfDocument | undefined>(undefined);
+  const [pdfReady, setPdfReady] = useState(false);
   const pdfLoadingTaskRef = useRef<PdfLoadingTask | undefined>(undefined);
   const imageCache = useRef(new Map<number, string>());
   const renderJobs = useRef(new Map<number, Promise<string>>());
@@ -2476,6 +2480,7 @@ export default function Home() {
     const previousPdf = pdfRef.current;
     pdfLoadingTaskRef.current = undefined;
     pdfRef.current = undefined;
+    setPdfReady(false);
     if (previousLoadingTask) void previousLoadingTask.destroy();
     else if (previousPdf) void previousPdf.loadingTask.destroy();
     pageNavigationCleanup.current();
@@ -2524,6 +2529,7 @@ export default function Home() {
       return false;
     }
     pdfRef.current = pdf;
+    setPdfReady(true);
     setTotalPages(pdf.numPages);
     setDocumentReady(true);
     setLoadingDocument(false);
@@ -3023,7 +3029,9 @@ export default function Home() {
       void failure.catch((error) => {
         if (sequence !== documentLoadSequence.current) return;
         pdfRef.current = undefined;
+        setPdfReady(false);
         setStorageMessage(messagesRef.current.openLocalFailed(error.message));
+        setDocumentError(messagesRef.current.openLocalFailed(error.message));
         void loadingTask.destroy();
       });
       const pdf = await Promise.race([loadingTask.promise, failure]);
@@ -3035,6 +3043,7 @@ export default function Home() {
       if (sequence !== documentLoadSequence.current) return;
       const detail = error instanceof Error ? error.message : "Unknown PDF error";
       setStorageMessage(currentMessages.openLocalFailed(detail));
+      setDocumentError(currentMessages.openLocalFailed(detail));
     }
   }, [beginDocumentLoad, finishDocumentLoad, loadNavigation, translationSettings]);
 
@@ -3524,6 +3533,7 @@ export default function Home() {
                   pageImageUrl={serverBookAvailable
                     ? `/api/books/${encodeURIComponent(documentId)}/pages/${page}?profile=display`
                     : undefined}
+                  pdfReady={pdfReady}
                   renderPageToCanvas={renderPageToCanvas}
                   requestTranslation={requestTranslation}
                   onTranslationAnimationComplete={completeTranslationAnimation}
