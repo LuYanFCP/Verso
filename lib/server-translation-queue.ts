@@ -4,6 +4,7 @@ import { createPriorityTaskQueue } from "./priority-task-queue";
 import { generateTranslation, type TranslationRequest } from "./server-translation";
 import { deduplicatePageBoundary, hasLayoutContent, normalizeTranslationPayload, type LayoutBlock } from "./translation-layout";
 import { extractNavigationObservation } from "./document-navigation";
+import { TRANSLATION_CACHE_LAYOUT_VERSION, translationCacheKey, translationCacheSuffix } from "./translation-cache";
 
 type Result = Awaited<ReturnType<typeof generateTranslation>> & {
   markdown?: string;
@@ -21,15 +22,13 @@ const globalState = globalThis as typeof globalThis & { versoTranslationWorker?:
 const state: NonNullable<typeof globalState.versoTranslationWorker> = globalState.versoTranslationWorker ??= { tasks: createPriorityTaskQueue<Result>(), pumping: false, generations: new Map() };
 
 function key(documentId: string, page: number, language: string) {
-  return `layout-v3::${documentId}::${page}::server-v1::${language}`;
+  return translationCacheKey(documentId, page, language);
 }
 
 async function readTranslation(documentId: string, page: number, language: string) {
   const { db } = getStorage();
-  const row = await db.prepare(`SELECT payload FROM translations WHERE document_id = ?1 AND page = ?2
-    AND substr(cache_key, -length(?3)) = ?3
-    ORDER BY (cache_key = ?4) DESC, updated_at DESC LIMIT 1`)
-    .bind(documentId, page, `::${language}`, key(documentId, page, language)).first<{ payload: string }>();
+  const row = await db.prepare("SELECT payload FROM translations WHERE cache_key = ?1 LIMIT 1")
+    .bind(key(documentId, page, language)).first<{ payload: string }>();
   return row ? normalizeTranslationPayload(JSON.parse(row.payload)) as Result : null;
 }
 
@@ -150,9 +149,10 @@ export async function listTranslationQueue(language: string) {
   await ensureStorageSchema(db);
   const result = await db.prepare(`SELECT q.document_id AS documentId, q.status, q.error, b.page_count AS totalPages,
     (SELECT COUNT(DISTINCT t.page) FROM translations t WHERE t.document_id = q.document_id
-      AND t.page BETWEEN 1 AND b.page_count AND substr(t.cache_key, -length(?2)) = ?2) AS completedPages
+      AND t.page BETWEEN 1 AND b.page_count AND substr(t.cache_key, -length(?2)) = ?2
+      AND substr(t.cache_key, 1, length(?3)) = ?3) AS completedPages
     FROM translation_queue q JOIN books b ON b.fingerprint = q.document_id WHERE q.target_language = ?1`)
-    .bind(language, `::${language}`).all();
+    .bind(language, `::${translationCacheSuffix(language)}`, `${TRANSLATION_CACHE_LAYOUT_VERSION}::`).all();
   return result.results;
 }
 

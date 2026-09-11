@@ -22,6 +22,8 @@ import { captionSourceRect, groupTranslationMedia, imagePlacement } from "../lib
 import { typewriterDuration, typewriterProgress } from "../lib/translation-typewriter.ts";
 import { resolveUiLocale, UI_LOCALE_COOKIE } from "../lib/ui-locale.ts";
 import { isPageWorkEnabled, pageWorkWindow, shouldStartTranslationRequest } from "../lib/viewport-work.ts";
+import { prepareDisplayEquation, renderMath, splitMathText } from "../lib/math-content.ts";
+import { translationCacheKey, translationCacheSuffix } from "../lib/translation-cache.ts";
 import nextConfig from "../next.config.ts";
 
 let baseUrl;
@@ -100,6 +102,37 @@ test("does not open local storage while server modules load", async () => {
     child.once("exit", (code) => code === 0 ? resolve() : reject(new Error(`Module import exited with ${code}.`)));
   });
   await assert.rejects(access(importDataDirectory), { code: "ENOENT" });
+});
+
+test("separates equation annotations without changing mathematical symbols", () => {
+  const expression = String.raw`\hat{X}_l = B_{l-1} X_{l-1} + C_{l-1} Y_{l-1}`;
+  const annotation = String.raw`\text{残差更新，对 } n \text{ 进行收缩}`;
+  assert.deepEqual(prepareDisplayEquation(`\\[${expression} \\quad ${annotation}\\]`, "3"), {
+    expression, annotation, number: "(3)",
+  });
+  assert.match(renderMath(expression, true), /<math /);
+  assert.match(renderMath(annotation, false), /<math /);
+  assert.deepEqual(prepareDisplayEquation("$$X_l = A_l X_l$$", " (A.1) "), {
+    expression: "X_l = A_l X_l", annotation: "", number: "(A.1)",
+  });
+  assert.equal(prepareDisplayEquation("x=y", "A.2a").number, "(A.2a)");
+  assert.equal(prepareDisplayEquation("x=y", "").number, "");
+  assert.equal(prepareDisplayEquation("x=y", "[7]").number, "[7]");
+});
+
+test("keeps mathematical spacing inside expressions and environments intact", () => {
+  for (const expression of [
+    String.raw`X_{l+1}=B_l X_l, \quad (A_l,B_l,C_l)=\mathcal{H}(X_l)`,
+    String.raw`\frac{x\quad\text{units}}{n}`,
+    String.raw`\begin{cases}x\quad\text{if }x>0\\0\quad\text{otherwise}\end{cases}`,
+    String.raw`\left(x\quad\text{units}\right)`,
+  ]) {
+    assert.deepEqual(prepareDisplayEquation(expression, "2"), { expression, annotation: "", number: "(2)" });
+    assert.match(renderMath(expression, true), /<math /);
+  }
+  assert.deepEqual(prepareDisplayEquation(String.raw`\{x\}\qquad\text{a set}`, ""), {
+    expression: String.raw`\{x\}`, annotation: String.raw`\text{a set}`, number: "",
+  });
 });
 
 test("allows development access through homelab proxies", () => {
@@ -348,6 +381,28 @@ test("keeps legacy browser-provider translations readable after server migration
   });
   assert.equal(searchResponse.status, 200);
   assert.deepEqual((await searchResponse.json()).matches.map(({ page }) => page), [3]);
+});
+
+test("uses a new cache namespace for structured mathematical translations", () => {
+  assert.equal(translationCacheSuffix("Simplified Chinese"), "server-v2::Simplified Chinese");
+  assert.equal(
+    translationCacheKey("book", 15, "Simplified Chinese"),
+    "layout-v4::book::15::server-v2::Simplified Chinese",
+  );
+});
+
+test("renders display and inline mathematics without trusting unsafe LaTeX", () => {
+  assert.deepEqual(splitMathText(String.raw`令 \(x_i\) 为词元，并计算 \[\frac{1}{n}\sum_j x_j^2\]。`), [
+    { text: "令 ", math: false, display: false, start: 0, end: 2 },
+    { text: "x_i", math: true, display: false, start: 2, end: 9 },
+    { text: " 为词元，并计算 ", math: false, display: false, start: 9, end: 18 },
+    { text: String.raw`\frac{1}{n}\sum_j x_j^2`, math: true, display: true, start: 18, end: 45 },
+    { text: "。", math: false, display: false, start: 45, end: 46 },
+  ]);
+  assert.match(renderMath(String.raw`\Delta_t=\sqrt{n}D_r\widehat{G}_tD_c,\quad \frac{1}{n}\sum_{j=1}^n(\Delta_t)_{ij}^2\approx1`, true), /<math /);
+  assert.equal(renderMath(String.raw`\frac{`, true), null);
+  assert.equal(renderMath("x".repeat(10_001), false), null);
+  assert.doesNotMatch(renderMath(String.raw`\href{javascript:alert(1)}{x}`, false) || "", /<a\b|href=/);
 });
 
 test("searches translated blocks without matching source text", () => {
@@ -863,7 +918,9 @@ test("requests and persists image crops, typography, and sentence positions with
         assert.ok(blockSchema.required.includes("sentences"));
         assert.ok(blockSchema.required.includes("imageRole"));
         assert.ok(blockSchema.properties.kind.enum.includes("image"));
+        assert.ok(blockSchema.properties.kind.enum.includes("equation"));
       }
+      assert.match(instruction, /valid KaTeX-compatible LaTeX/);
       const key = `layout-v3::aligned-${format}::2::server-v1::Simplified Chinese`;
       const saved = await fetch(`${baseUrl}/api/translations`, {
         method: "PUT", headers: { "Content-Type": "application/json" },
@@ -1385,7 +1442,7 @@ test("persists whole-book work, shares reader requests, skips cached blank pages
     assert.equal(settings.status, 200);
     const blank = await fetch(`${baseUrl}/api/translations`, {
       method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({
-        key: `layout-v3::${book.fingerprint}::1::server-v1::English`, documentId: book.fingerprint, page: 1,
+        key: translationCacheKey(book.fingerprint, 1, "English"), documentId: book.fingerprint, page: 1,
         translation: { page: 1, blocks: [], isBlank: true, markdown: "" },
       }),
     });
@@ -1443,7 +1500,7 @@ test("persists whole-book work, shares reader requests, skips cached blank pages
     responses.get(1)();
     await new Promise((resolve) => setTimeout(resolve, 150));
     assert.equal(await queueStatus(discardBook.fingerprint), undefined);
-    const query = new URLSearchParams({ documentId: discardBook.fingerprint, cacheKeySuffix: "server-v1::English" });
+    const query = new URLSearchParams({ documentId: discardBook.fingerprint, cacheKeySuffix: translationCacheSuffix("English") });
     assert.deepEqual((await (await fetch(`${baseUrl}/api/translations?${query}`)).json()).pages, []);
 
     const restartBook = await uploadQueueBook("e".repeat(64), 2);

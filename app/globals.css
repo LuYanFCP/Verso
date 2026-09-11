@@ -245,6 +245,18 @@ button { color: inherit; }
 .layout-block.size-md { font-size: 16px; }
 .layout-block.size-lg { font-size: 22px; }
 .layout-block.size-xl { font-size: 29px; }
+.block-equation { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; column-gap: 1em; margin-bottom: .8em; line-height: 1.5; text-indent: 0; }
+.block-equation.annotated-equation { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) auto; }
+.block-equation:has(+ .block-equation) { margin-bottom: .25em; }
+.block-equation + .block-equation.before-none { margin-top: 0; }
+.equation-expression, .equation-annotation { min-width: 0; overflow-x: auto; }
+.equation-annotation { text-align: left; }
+.equation-number { grid-column: -2 / -1; font-size: 1em; white-space: nowrap; font-variant-numeric: tabular-nums; }
+.translation-math .katex { font-size: 1.05em; }
+.display-math { display: block; max-width: 100%; overflow-x: auto; }
+.display-math .katex-display { margin: 0; padding: .15em 0; }
+.translation-math-fallback { font-family: var(--font-geist-mono), monospace; font-size: .82em; white-space: pre-wrap; overflow-wrap: anywhere; }
+.translation-math-pending { visibility: hidden; }
 .translation-meta { margin-top: 42px; padding-top: 14px; border-top: 1px solid #e9ece8; display: flex; align-items: center; gap: 7px; font-family: var(--font-geist-sans); font-size: 10px; color: #829089; }
 .translation-meta svg { color: #4a9b76; }
 .blank-translation-state { min-height: 420px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px; color: #8b9690; font-family: var(--font-geist-sans); font-size: 12px; }

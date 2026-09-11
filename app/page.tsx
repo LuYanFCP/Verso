@@ -63,6 +63,8 @@ import { useUiLocale } from "./ui-locale";
 import { SourceImageCrop } from "./source-image-crop";
 import { ReaderViewport, READER_PAGE_WIDTH, MIN_READER_ZOOM, MAX_READER_ZOOM } from "./reader-viewport";
 import { alignSourceBlocks, type SourcePageLayout } from "../lib/source-alignment";
+import { DisplayEquation, MathText } from "./math-content";
+import { translationCacheKey, translationCacheSuffix } from "../lib/translation-cache";
 
 type PdfDocument = import("pdfjs-dist").PDFDocumentProxy;
 type PdfLoadingTask = import("pdfjs-dist").PDFDocumentLoadingTask;
@@ -588,26 +590,20 @@ function isWorkCancellation(error: unknown) {
 }
 
 function cacheKey(documentId: string, page: number, settings: TranslationSettings) {
-  return ["layout-v3", documentId, page, cacheKeySuffix(settings)].join("::");
+  return translationCacheKey(documentId, page, settings.targetLanguage);
 }
 
 function cacheKeySuffix(settings: TranslationSettings) {
-  return ["server-v1", settings.targetLanguage].join("::");
+  return translationCacheSuffix(settings.targetLanguage);
 }
 
 async function readLocalCache(
   key: string,
-  documentId: string,
-  page: number,
-  settings: TranslationSettings,
   fallbackMessage: string,
   signal?: AbortSignal,
 ): Promise<Translation | undefined> {
   const query = new URLSearchParams({
     key,
-    documentId,
-    page: String(page),
-    fallbackCacheKeySuffix: settings.targetLanguage,
   });
   const response = await fetch(`/api/translations?${query}`, { cache: "no-store", signal });
   const result = await response.json() as { translation?: Translation | null; error?: string };
@@ -623,7 +619,6 @@ async function readLocalTranslationIndex(
   const query = new URLSearchParams({
     documentId,
     cacheKeySuffix: cacheKeySuffix(settings),
-    fallbackCacheKeySuffix: settings.targetLanguage,
   });
   const response = await fetch(`/api/translations?${query}`, { cache: "no-store" });
   const result = await response.json() as { pages?: unknown; error?: string };
@@ -828,8 +823,17 @@ function MappedTranslationText({ block, query, offset, progress, onHighlight }: 
   progress: number;
   onHighlight: (rects: SourceRect[]) => void;
 }) {
+  const renderText = (text: string, start: number) => (
+    <MathText
+      text={text}
+      progress={Math.max(0, progress - start)}
+      renderText={(plainText, localOffset) => (
+        <TypewriterText text={plainText} query={query} offset={start + localOffset} progress={progress} />
+      )}
+    />
+  );
   if (!block.sentences?.length) {
-    return <TypewriterText text={block.text} query={query} offset={offset} progress={progress} />;
+    return renderText(block.text, offset);
   }
   const sentences = block.sentences;
   return sentences.map((sentence, index) => {
@@ -846,7 +850,7 @@ function MappedTranslationText({ block, query, offset, progress, onHighlight }: 
         onFocus={() => onHighlight(interactive ? sentence.sourceRects : [])}
         onBlur={() => onHighlight([])}
       >
-        <TypewriterText text={sentence.text} query={query} offset={start} progress={progress} />
+        {renderText(sentence.text, start)}
       </span>
     );
   });
@@ -922,7 +926,7 @@ function TranslationText({
   const texts = value.blocks?.length
     ? displayBlocks.flatMap(({ block, caption }) => {
       if (caption) return [caption.text];
-      if (block.kind === "spacer" || block.kind === "image") return [];
+      if (block.kind === "spacer" || block.kind === "image" || block.kind === "equation") return [];
       if (block.kind === "list_item") return [block.marker, block.text, block.trailing];
       return [block.text];
     })
@@ -989,6 +993,9 @@ function TranslationText({
               ) : null;
             }
             const style = block.fontSize ? { fontSize: block.fontSize * READER_PAGE_WIDTH } : undefined;
+            if (block.kind === "equation") {
+              return <DisplayEquation key={index} className={className} style={style} text={block.text} number={block.trailing} />;
+            }
             if (block.kind === "list_item") {
               const markerIndex = segmentIndex++;
               const textIndex = segmentIndex++;
@@ -1036,7 +1043,18 @@ function TranslationText({
     <article className="translation-copy">
       {texts.map((paragraph, index) => (
         <p key={`${index}-${paragraph}`}>
-          <TypewriterText text={paragraph} query={searchQuery} offset={offsets[index] ?? 0} progress={progress} />
+          <MathText
+            text={paragraph}
+            progress={Math.max(0, progress - (offsets[index] ?? 0))}
+            renderText={(plainText, localOffset) => (
+              <TypewriterText
+                text={plainText}
+                query={searchQuery}
+                offset={(offsets[index] ?? 0) + localOffset}
+                progress={progress}
+              />
+            )}
+          />
         </p>
       ))}
       <div className="translation-meta">
@@ -2340,7 +2358,6 @@ export default function Home() {
             documentId,
             query,
             cacheKeySuffix: cacheKeySuffix(translationSettings),
-            fallbackCacheKeySuffix: translationSettings.targetLanguage,
           }),
           signal: controller.signal,
         });
@@ -2756,9 +2773,6 @@ export default function Home() {
       try {
         return await readLocalCache(
           previousKey,
-          documentId,
-          page - 1,
-          translationSettings,
           currentMessages.localTranslationReadFailed,
           controller.signal,
         );
@@ -2773,9 +2787,6 @@ export default function Home() {
       if (!force) {
         const cached = await readLocalCache(
           key,
-          documentId,
-          page,
-          translationSettings,
           currentMessages.localTranslationReadFailed,
           controller.signal,
         );
