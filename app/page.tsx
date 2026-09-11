@@ -29,7 +29,7 @@ import {
   Upload,
   X,
 } from "lucide-react";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
 import {
   DEFAULT_AI_PROVIDER_SETTINGS,
   type AiProvider,
@@ -160,7 +160,7 @@ const UI_MESSAGES = {
     blankCached: "空白页已保存到本机",
     boundaryFixed: "跨页重复已校正 · 已保存到本机",
     revised: "已结合下一页修订 · 已保存到本机",
-    cachedLayout: "译文已保存到本机 · 保留原页布局",
+    cachedLayout: "译文已保存到本机 · 保留原文结构",
     cached: "译文已保存到本机",
     sourcePage: (page: number) => `原文 · ${page}`,
     translatedPage: (page: number) => `译文 · ${page}`,
@@ -322,7 +322,7 @@ const UI_MESSAGES = {
     blankCached: "Blank page saved locally",
     boundaryFixed: "Cross-page overlap fixed · Saved locally",
     revised: "Revised with the next page · Saved locally",
-    cachedLayout: "Translation saved locally · Source layout preserved",
+    cachedLayout: "Translation saved locally · Source structure preserved",
     cached: "Translation saved locally",
     sourcePage: (page: number) => `Source · ${page}`,
     translatedPage: (page: number) => `Translation · ${page}`,
@@ -996,7 +996,9 @@ function TranslationText({
                 />
               ) : null;
             }
-            const style = block.fontSize ? { fontSize: block.fontSize * READER_PAGE_WIDTH } : undefined;
+            const style = block.fontSize
+              ? { "--source-font-size": `${block.fontSize * READER_PAGE_WIDTH}px` } as CSSProperties
+              : undefined;
             if (block.kind === "equation") {
               return <DisplayEquation key={index} className={className} style={style} text={block.text} number={block.trailing} />;
             }
