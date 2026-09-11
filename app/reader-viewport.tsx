@@ -1,6 +1,7 @@
 "use client";
 
 import { createContext, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
+import type { ReaderTypography } from "../lib/reader-typography";
 
 export const READER_PAGE_WIDTH = 576;
 const SPREAD_WIDTH = 1200;
@@ -93,13 +94,15 @@ export function ReaderDivider() {
   );
 }
 
-export function ReaderViewport({ children, zoom, onZoom, currentPage, dividerLabel, dividerValueText }: {
+export function ReaderViewport({ children, zoom, onZoom, currentPage, dividerLabel, dividerValueText, fontSize, fontFamily }: {
   children: ReactNode;
   zoom: number;
   onZoom: (update: (zoom: number) => number) => void;
   currentPage: number;
   dividerLabel: string;
   dividerValueText: (percent: number) => string;
+  fontSize: number;
+  fontFamily: ReaderTypography["translationFontFamily"];
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const [fitScale, setFitScale] = useState(1);
@@ -153,18 +156,18 @@ export function ReaderViewport({ children, zoom, onZoom, currentPage, dividerLab
     if (!node) return;
     const rect = node.getBoundingClientRect();
     window.scrollBy({ top: rect.top + saved.fraction * rect.height - saved.top, behavior: "instant" });
-  }, [fitScale, zoom, sourcePercent]);
+  }, [fitScale, zoom, sourcePercent, fontSize, fontFamily]);
 
   useEffect(() => {
     const change = (update: (value: number) => number) => {
       rememberAnchor();
       onZoom((value) => Math.min(MAX_READER_ZOOM, Math.max(MIN_READER_ZOOM, update(value))));
     };
-    const controlZoom = (event: Event) => {
-      if (event.target instanceof Element && event.target.closest(".reader-zoom")) rememberAnchor();
+    const controlLayout = (event: Event) => {
+      if (event.target instanceof Element && event.target.closest(".reader-zoom, .reader-font-controls")) rememberAnchor();
     };
     const keydown = (event: KeyboardEvent) => {
-      if (["Enter", " "].includes(event.key)) controlZoom(event);
+      if (["Enter", " "].includes(event.key)) controlLayout(event);
       if (!(event.ctrlKey || event.metaKey) || event.altKey) return;
       if (event.target instanceof HTMLElement && event.target.closest("input, textarea, select, [contenteditable=true]")) return;
       if (!["+", "=", "-", "0"].includes(event.key)) return;
@@ -176,11 +179,13 @@ export function ReaderViewport({ children, zoom, onZoom, currentPage, dividerLab
       event.preventDefault();
       change((value) => value * Math.exp(-event.deltaY * 0.002));
     };
-    window.addEventListener("pointerdown", controlZoom, { capture: true });
+    window.addEventListener("pointerdown", controlLayout, { capture: true });
+    window.addEventListener("input", controlLayout, { capture: true });
     window.addEventListener("keydown", keydown, { capture: true });
     window.addEventListener("wheel", wheel, { passive: false, capture: true });
     return () => {
-      window.removeEventListener("pointerdown", controlZoom, { capture: true });
+      window.removeEventListener("pointerdown", controlLayout, { capture: true });
+      window.removeEventListener("input", controlLayout, { capture: true });
       window.removeEventListener("keydown", keydown, { capture: true });
       window.removeEventListener("wheel", wheel, { capture: true });
     };
@@ -188,8 +193,9 @@ export function ReaderViewport({ children, zoom, onZoom, currentPage, dividerLab
 
   return (
     <ReaderColumns.Provider value={columns}>
-      <div className="reader-viewport" ref={ref} data-resizing={resizing || undefined}>
+      <div className="reader-viewport" ref={ref} data-resizing={resizing || undefined} data-translation-font={fontFamily}>
         <div className="spreads" style={{ width: SPREAD_WIDTH, zoom: fitScale * zoom,
+          "--translation-font-scale": fontSize / 100,
           "--reader-source-width": `${sourcePercent}%`, "--reader-scale": fitScale * zoom } as CSSProperties}>{children}</div>
       </div>
     </ReaderColumns.Provider>

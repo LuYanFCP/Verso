@@ -24,12 +24,27 @@ import { resolveUiLocale, UI_LOCALE_COOKIE } from "../lib/ui-locale.ts";
 import { isPageWorkEnabled, pageWorkWindow, shouldStartTranslationRequest } from "../lib/viewport-work.ts";
 import { prepareDisplayEquation, renderMath, splitMathText } from "../lib/math-content.ts";
 import { translationCacheKey, translationCacheSuffix } from "../lib/translation-cache.ts";
+import { normalizeReaderTypography } from "../lib/reader-typography.ts";
 import nextConfig from "../next.config.ts";
 
 let baseUrl;
 let serverProcess;
 let testDataDirectory;
 let rendererLogPath;
+
+test("restores font preferences safely from old or invalid reader settings", () => {
+  const defaults = { translationFontSize: 100, translationFontFamily: "serif" };
+  assert.deepEqual(normalizeReaderTypography({}), defaults);
+  for (const value of [undefined, null, "150", NaN, Infinity]) {
+    assert.deepEqual(normalizeReaderTypography({ translationFontSize: value, translationFontFamily: "unknown" }), defaults);
+  }
+  assert.deepEqual(normalizeReaderTypography({ translationFontSize: 145, translationFontFamily: "sans" }), {
+    translationFontSize: 145, translationFontFamily: "sans",
+  });
+  assert.equal(normalizeReaderTypography({ translationFontSize: -100 }).translationFontSize, 80);
+  assert.equal(normalizeReaderTypography({ translationFontSize: 1000 }).translationFontSize, 180);
+  assert.equal(normalizeReaderTypography({ translationFontSize: 127 }).translationFontSize, 125);
+});
 
 before(async () => {
   testDataDirectory = await mkdtemp(path.join(tmpdir(), "verso-test-"));

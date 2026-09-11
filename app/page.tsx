@@ -62,6 +62,8 @@ import { pageWorkWindow, isPageWorkEnabled, shouldStartTranslationRequest } from
 import { useUiLocale } from "./ui-locale";
 import { SourceImageCrop } from "./source-image-crop";
 import { ReaderDivider, ReaderViewport, READER_PAGE_WIDTH, MIN_READER_ZOOM, MAX_READER_ZOOM } from "./reader-viewport";
+import { ReaderFontControls } from "./reader-font-controls";
+import { DEFAULT_READER_TYPOGRAPHY, normalizeReaderTypography, type ReaderTypography } from "../lib/reader-typography";
 import { alignSourceBlocks, type SourcePageLayout } from "../lib/source-alignment";
 import { DisplayEquation, MathText } from "./math-content";
 import { translationCacheKey, translationCacheSuffix } from "../lib/translation-cache";
@@ -100,7 +102,7 @@ type TranslationSettings = {
   translationConcurrency: number;
 };
 
-type AppSettings = TranslationSettings & {
+type AppSettings = TranslationSettings & ReaderTypography & {
   schemaVersion: number;
   nearbyPages: number;
   smoothScrolling: boolean;
@@ -176,6 +178,10 @@ const UI_MESSAGES = {
     zoomOut: "缩小阅读视图",
     fitWidth: "适应宽度",
     readerZoom: "阅读视图缩放",
+    readerFont: {
+      label: "字体", title: "译文字体", size: "字号", decrease: "缩小译文字号", increase: "放大译文字号",
+      family: "字体样式", serif: "衬线", sans: "无衬线", reset: "恢复默认", close: "关闭字体设置",
+    },
     readerDivider: "拖动调整原文和译文宽度；双击或按 Enter 恢复对半，方向键微调",
     readerDividerValue: (percent: number) => `原文 ${percent}%，译文 ${100 - percent}%`,
     readingContext: (page: number) => `正在读取第 ${page} 页及相邻上下文`,
@@ -338,6 +344,10 @@ const UI_MESSAGES = {
     zoomOut: "Zoom out reading view",
     fitWidth: "Fit width",
     readerZoom: "Reading view zoom",
+    readerFont: {
+      label: "Font", title: "Translation font", size: "Font size", decrease: "Decrease translation font size", increase: "Increase translation font size",
+      family: "Font style", serif: "Serif", sans: "Sans serif", reset: "Reset to default", close: "Close font settings",
+    },
     readerDivider: "Drag to resize source and translation; double-click or press Enter to reset, arrow keys to adjust",
     readerDividerValue: (percent: number) => `Source ${percent}%, translation ${100 - percent}%`,
     readingContext: (page: number) => `Reading page ${page} and adjacent context`,
@@ -505,6 +515,7 @@ function targetLanguageLabel(value: string, locale: UiLocale) {
 }
 
 const DEFAULT_SETTINGS: AppSettings = {
+  ...DEFAULT_READER_TYPOGRAPHY,
   schemaVersion: 2,
   targetLanguage: "Simplified Chinese",
   nearbyPages: 2,
@@ -1994,6 +2005,7 @@ export default function Home() {
       const storedSettings = JSON.parse(stored) as Partial<AppSettings>;
       return {
         ...DEFAULT_SETTINGS,
+        ...normalizeReaderTypography(storedSettings),
         targetLanguage: storedSettings.targetLanguage || DEFAULT_SETTINGS.targetLanguage,
         nearbyPages: Number.isInteger(storedSettings.nearbyPages) ? storedSettings.nearbyPages! : DEFAULT_SETTINGS.nearbyPages,
         translationConcurrency: Number.isInteger(storedSettings.translationConcurrency)
@@ -3455,11 +3467,15 @@ export default function Home() {
               </div>
             </div>
             <div className="column-labels"><span>{messages.sourceScan}</span><i /><span><Languages size={15} /> {targetLanguageLabel(settings.targetLanguage, locale)}</span></div>
-            <div className="reader-zoom" role="group" aria-label={messages.readerZoom}>
-              <button className="icon-button" aria-label={messages.zoomOut} disabled={readerZoom <= MIN_READER_ZOOM} onClick={() => setReaderZoom((value) => Math.max(MIN_READER_ZOOM, value - 0.1))}><Minus size={16} /></button>
-              <button className="zoom-fit" title={messages.fitWidth} onClick={() => setReaderZoom(1)}>{Math.round(readerZoom * 100)}%</button>
-              <button className="icon-button" aria-label={messages.zoomIn} disabled={readerZoom >= MAX_READER_ZOOM} onClick={() => setReaderZoom((value) => Math.min(MAX_READER_ZOOM, value + 0.1))}><Plus size={16} /></button>
-              <button className="zoom-fit" onClick={() => setReaderZoom(1)}>{messages.fitWidth}</button>
+            <div className="reader-display-controls">
+              <ReaderFontControls value={{ translationFontSize: settings.translationFontSize, translationFontFamily: settings.translationFontFamily }} messages={messages.readerFont}
+                onChange={(typography) => setSettings((previous) => ({ ...previous, ...typography }))} />
+              <div className="reader-zoom" role="group" aria-label={messages.readerZoom}>
+                <button className="icon-button" aria-label={messages.zoomOut} disabled={readerZoom <= MIN_READER_ZOOM} onClick={() => setReaderZoom((value) => Math.max(MIN_READER_ZOOM, value - 0.1))}><Minus size={16} /></button>
+                <button className="zoom-fit" title={messages.fitWidth} onClick={() => setReaderZoom(1)}>{Math.round(readerZoom * 100)}%</button>
+                <button className="icon-button" aria-label={messages.zoomIn} disabled={readerZoom >= MAX_READER_ZOOM} onClick={() => setReaderZoom((value) => Math.min(MAX_READER_ZOOM, value + 0.1))}><Plus size={16} /></button>
+                <button className="zoom-fit" onClick={() => setReaderZoom(1)}>{messages.fitWidth}</button>
+              </div>
             </div>
             <div className="reader-menu-anchor" ref={readerMenu}>
               <button
@@ -3520,6 +3536,7 @@ export default function Home() {
             </div>
           ) : (
             <ReaderViewport zoom={readerZoom} onZoom={setReaderZoom} currentPage={currentPage}
+              fontSize={settings.translationFontSize} fontFamily={settings.translationFontFamily}
               dividerLabel={messages.readerDivider} dividerValueText={messages.readerDividerValue}>
               {pageNumbers.map((page) => (
                 <PageSpread
