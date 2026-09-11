@@ -954,6 +954,30 @@ test("grounds sentence highlights in PDF words instead of estimated model rectan
   assert.equal(aligned.fontSize, 0.02);
 });
 
+test("preserves equation typography while grounding highlights in small math glyphs", async () => {
+  const { parsePdfWordLayout, alignSourceBlocks } = await import("../lib/source-alignment.ts");
+  const layout = parsePdfWordLayout(`<page width="600" height="800"><line>
+    <word xMin="72" yMin="80" xMax="80" yMax="92">X</word>
+    <word xMin="80" yMin="88" xMax="82" yMax="94">l</word>
+    <word xMin="90" yMin="80" xMax="98" yMax="92">=</word>
+    <word xMin="105" yMin="80" xMax="113" yMax="92">B</word>
+    <word xMin="113" yMin="88" xMax="115" yMax="94">l</word>
+    <word xMin="120" yMin="80" xMax="128" yMax="92">X</word>
+    <word xMin="128" yMin="88" xMax="130" yMax="94">l</word></line></page>`);
+  const blocks = normalizeTranslationPayload({ blocks: [{
+    kind: "equation", text: "X_l = B_l X_l", fontSize: 0.02,
+    sourceRect: { x: 0.1, y: 0.09, width: 0.2, height: 0.04 },
+    sentences: [{ text: "X_l = B_l X_l", sourceText: "X_l = B_l X_l", sourceRects: [] }],
+  }] }).blocks;
+  const aligned = alignSourceBlocks(blocks, layout)[0];
+  assert.equal(aligned.fontSize, 0.02);
+  assert.equal(aligned.sentences[0].sourceRects.length, 1);
+  assert.equal(aligned.sentences[0].sourceRects[0].x, 0.12);
+  assert.equal(aligned.text, blocks[0].text);
+  const unmapped = { ...blocks[0], sentences: undefined };
+  assert.equal(alignSourceBlocks([unmapped], layout)[0].fontSize, 0.02);
+});
+
 test("aligns ligatures and hyphenated line breaks and refuses ungrounded text", async () => {
   const { parsePdfWordLayout, alignSourceBlocks } = await import("../lib/source-alignment.ts");
   const layout = parsePdfWordLayout(`<page width="600" height="800"><line>
