@@ -1,6 +1,8 @@
 "use client";
 /* eslint-disable @next/next/no-img-element */
 
+import { readTranslationResponse, type TranslationProgress } from "../lib/translation-progress";
+import { recordClientTiming, recordTranslationTrace, type TranslationTrace } from "../lib/translation-trace";
 import {
   BookOpen,
   ChevronDown,
@@ -663,13 +665,25 @@ function TranslationText({
   );
 }
 
-function TranslationSkeleton({ page, messages, cached }: { page: number; messages: UiMessages; cached: boolean }) {
+function TranslationLiveProgress({ progress, messages }: { progress: TranslationProgress; messages: UiMessages }) {
+  const phase = progress.phase;
+  return <div className="translation-live" role="status" aria-live="polite" aria-atomic="true" title={messages.translationStatsHelp}>
+    <span className="translation-live-phase"><LoaderCircle className="spin" size={12} />{messages.translationPhases[phase]}</span>
+    <span className="translation-live-counts">
+      {(progress?.tokens ?? 0).toLocaleString()} tok
+      <span aria-hidden="true"> · </span>{(progress?.characters ?? 0).toLocaleString()} char
+      <span aria-hidden="true"> · </span>{progress?.tokensPerSecond === undefined ? "—" : progress.tokensPerSecond.toFixed(1)} TPS
+    </span>
+  </div>;
+}
+
+function TranslationSkeleton({ page, messages, cached, showStatus = true }: { page: number; messages: UiMessages; cached: boolean; showStatus?: boolean }) {
   return (
     <div className="translation-skeleton">
-      <div className="ai-working">
+      {showStatus && <div className="ai-working">
         {cached ? <HardDrive size={15} /> : <Sparkles size={15} />}
         {cached ? messages.loadingCachedTranslation(page) : messages.readingContext(page)}
-      </div>
+      </div>}
       <i /><i /><i /><i className="short" />
     </div>
   );
@@ -687,6 +701,7 @@ type PageSpreadProps = {
   animateTranslation: boolean;
   translationAnimationSpeed: number;
   loading: boolean;
+  progress?: TranslationProgress;
   error?: string;
   pageImageUrl?: string;
   renderPageToCanvas: (page: number, canvas: HTMLCanvasElement, signal: AbortSignal) => Promise<void>;
@@ -709,6 +724,7 @@ function PageSpread({
   animateTranslation,
   translationAnimationSpeed,
   loading,
+  progress,
   error,
   pageImageUrl,
   renderPageToCanvas,
@@ -751,6 +767,7 @@ function PageSpread({
   const [renderError, setRenderError] = useState("");
   const [renderAttempt, setRenderAttempt] = useState(0);
   const cachedTranslation = translationSource === "cache";
+  const translating = loading && Boolean(progress);
   const finishTranslationAnimation = useCallback(
     () => onTranslationAnimationComplete(page, translation?.cacheVersion),
     [onTranslationAnimationComplete, page, translation?.cacheVersion],
@@ -874,16 +891,19 @@ function PageSpread({
       <div className="translated-page page-surface">
         <div className="translation-heading">
           <div className="page-label">{messages.translatedPage(page)}</div>
-          {(translation || loading) && (
-            <button
-              className="icon-button subtle"
-              aria-label={loading ? messages.restartTranslation : messages.retranslate}
-              title={loading ? messages.restartTranslation : messages.retranslate}
-              onClick={() => requestTranslation(page, true)}
-            >
-              <RefreshCw className={cn(loading && "spin")} size={15} />
-            </button>
-          )}
+          <div className="translation-heading-actions">
+            {loading && progress && <TranslationLiveProgress progress={progress} messages={messages} />}
+            {(translation || translating) && (
+              <button
+                className="icon-button subtle"
+                aria-label={translating ? messages.restartTranslation : messages.retranslate}
+                title={translating ? messages.restartTranslation : messages.retranslate}
+                onClick={() => requestTranslation(page, true)}
+              >
+                <RefreshCw className={cn(translating && "spin")} size={15} />
+              </button>
+            )}
+          </div>
         </div>
         {translation ? (
           <TranslationText
@@ -898,14 +918,14 @@ function PageSpread({
             onAnimationComplete={finishTranslationAnimation}
           />
         ) : loading ? (
-          <TranslationSkeleton page={page} messages={messages} cached={cachedTranslation} />
+          <TranslationSkeleton page={page} messages={messages} cached={cachedTranslation} showStatus={false} />
         ) : error ? (
           <div className="translation-error">
             <p>{error}</p>
             <button className="secondary-button" onClick={() => requestTranslation(page, true)}>{messages.retry}</button>
           </div>
         ) : (
-          <TranslationSkeleton page={page} messages={messages} cached={cachedTranslation} />
+          <TranslationSkeleton page={page} messages={messages} cached={cachedTranslation} showStatus={cachedTranslation} />
         )}
       </div>
       {page < totalPages && <div className="spread-divider"><span>{messages.pageDivider(page + 1)}</span></div>}
@@ -1355,6 +1375,7 @@ export default function Home() {
   const [translations, setTranslations] = useState<Record<number, Translation>>(DEMO_TRANSLATIONS);
   const [translationSources, setTranslationSources] = useState<Record<number, TranslationSource>>({});
   const [translationAnimationVersions, setTranslationAnimationVersions] = useState<Record<number, number>>({});
+  const [translationProgress, setTranslationProgress] = useState<Record<number, TranslationProgress>>({});
   const [loadingPages, setLoadingPages] = useState<Set<number>>(new Set());
   const [errors, setErrors] = useState<Record<number, string>>({});
   const [localBooks, setLocalBooks] = useState<LocalBook[]>([]);
@@ -1452,6 +1473,7 @@ export default function Home() {
     for (const controller of translationRequests.current.values()) controller.abort();
     translationRequests.current.clear();
     setLoadingPages(new Set());
+    setTranslationProgress({});
   }, []);
 
   const cancelDocumentWork = useCallback(() => {
@@ -1496,6 +1518,7 @@ export default function Home() {
         setTranslationSources({});
         setTranslationAnimationVersions({});
         setLoadingPages(new Set());
+        setTranslationProgress({});
         setErrors({});
         setSearchMatches([]);
         setSearchError("");
@@ -1782,6 +1805,7 @@ export default function Home() {
     setSearchError("");
     setSearchLoading(false);
     setLoadingPages(new Set());
+    setTranslationProgress({});
     setErrors({});
     setSidebarView("pages");
     setNavigation({ observations: [], manualOffset: null });
@@ -2107,11 +2131,17 @@ export default function Home() {
           });
         }
       }
+      requireCurrentRun();
       if (!translationService.configured) throw new Error(currentMessages.apiKeyRequired);
+      // Cache reads must not appear as queued model requests.
+      setTranslationProgress((existing) => ({ ...existing, [page]: { phase: "queued" } }));
       previousTranslation = await readPreviousTranslation();
       requireCurrentRun();
 
+      const clientQueuedAt = performance.now();
       const payload = await translationLimiter.run(translationSettings.translationConcurrency, async () => {
+        recordClientTiming("queue.client", clientQueuedAt, page);
+        const imagesStartedAt = performance.now();
         requireCurrentRun();
         const contextPages = [page - 1, page, page + 1].filter((value) => value >= 1 && value <= totalPages);
         let imageSource = serverBookAvailable
@@ -2123,10 +2153,14 @@ export default function Home() {
               }))),
             };
         requireCurrentRun();
+        recordClientTiming("images.client", imagesStartedAt, page);
+        const receiveProgress = (progress: TranslationProgress) => {
+          if (isCurrentRun() && !controller.signal.aborted) setTranslationProgress((existing) => ({ ...existing, [page]: progress }));
+        };
         const sendTranslation = (source: typeof imageSource | { images: Array<{ page: number; dataUrl: string }> }) => (
           fetch("/api/translate", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
             body: JSON.stringify({
               targetLanguage: translationSettings.targetLanguage,
               translationConcurrency: translationSettings.translationConcurrency,
@@ -2141,8 +2175,9 @@ export default function Home() {
           })
         );
         let response = await sendTranslation(imageSource);
-        let result = await response.json() as TranslationResponse & { error?: string; code?: string };
-        if (!response.ok && result.code === "PAGE_RENDERER_UNAVAILABLE" && serverBookAvailable) {
+        let result = await readTranslationResponse<TranslationResponse & { error?: string; code?: string; trace?: TranslationTrace }>(response, receiveProgress);
+        if (result.trace) recordTranslationTrace(result.trace);
+        if (result.code === "PAGE_RENDERER_UNAVAILABLE" && serverBookAvailable) {
           requireCurrentRun();
           imageSource = {
             images: await Promise.all(contextPages.map(async (number) => ({
@@ -2152,9 +2187,10 @@ export default function Home() {
           };
           requireCurrentRun();
           response = await sendTranslation(imageSource);
-          result = await response.json() as TranslationResponse & { error?: string; code?: string };
+          result = await readTranslationResponse<TranslationResponse & { error?: string; code?: string; trace?: TranslationTrace }>(response, receiveProgress);
+          if (result.trace) recordTranslationTrace(result.trace);
         }
-        if (!response.ok) throw new Error(result.error || currentMessages.translationRequestFailed);
+        if (!response.ok || result.error) throw new Error(result.error || currentMessages.translationRequestFailed);
         if (!Array.isArray(result.blocks)) throw new Error(currentMessages.invalidTranslation);
         return result;
       }, controller.signal);
@@ -2222,6 +2258,7 @@ export default function Home() {
         translationRequests.current.delete(flightKey);
       }
       if (translationRuns.current.finish(flightKey, runToken) && documentSequence === documentLoadSequence.current) {
+        setTranslationProgress((existing) => { const next = { ...existing }; delete next[page]; return next; });
         setLoadingPages((existing) => {
           const next = new Set(existing);
           next.delete(page);
@@ -2820,6 +2857,7 @@ export default function Home() {
                     && translationAnimationVersions[page] === displayedTranslations[page]?.cacheVersion}
                   translationAnimationSpeed={settings.translationAnimationSpeed}
                   loading={loadingPages.has(page)}
+                  progress={translationProgress[page]}
                   error={errors[page]}
                   pageImageUrl={serverBookAvailable
                     ? `/api/books/${encodeURIComponent(documentId)}/pages/${page}?profile=display`
