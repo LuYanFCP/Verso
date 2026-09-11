@@ -61,7 +61,7 @@ import type { UiLocale } from "../lib/ui-locale";
 import { pageWorkWindow, isPageWorkEnabled, shouldStartTranslationRequest } from "../lib/viewport-work";
 import { useUiLocale } from "./ui-locale";
 import { SourceImageCrop } from "./source-image-crop";
-import { ReaderViewport, READER_PAGE_WIDTH, MIN_READER_ZOOM, MAX_READER_ZOOM } from "./reader-viewport";
+import { ReaderDivider, ReaderViewport, READER_PAGE_WIDTH, MIN_READER_ZOOM, MAX_READER_ZOOM } from "./reader-viewport";
 import { alignSourceBlocks, type SourcePageLayout } from "../lib/source-alignment";
 import { DisplayEquation, MathText } from "./math-content";
 import { translationCacheKey, translationCacheSuffix } from "../lib/translation-cache";
@@ -176,6 +176,8 @@ const UI_MESSAGES = {
     zoomOut: "缩小阅读视图",
     fitWidth: "适应宽度",
     readerZoom: "阅读视图缩放",
+    readerDivider: "拖动调整原文和译文宽度；双击或按 Enter 恢复对半，方向键微调",
+    readerDividerValue: (percent: number) => `原文 ${percent}%，译文 ${100 - percent}%`,
     readingContext: (page: number) => `正在读取第 ${page} 页及相邻上下文`,
     loadingCachedTranslation: (page: number) => `正在载入第 ${page} 页的缓存译文`,
     retry: "重试",
@@ -336,6 +338,8 @@ const UI_MESSAGES = {
     zoomOut: "Zoom out reading view",
     fitWidth: "Fit width",
     readerZoom: "Reading view zoom",
+    readerDivider: "Drag to resize source and translation; double-click or press Enter to reset, arrow keys to adjust",
+    readerDividerValue: (percent: number) => `Source ${percent}%, translation ${100 - percent}%`,
     readingContext: (page: number) => `Reading page ${page} and adjacent context`,
     loadingCachedTranslation: (page: number) => `Loading cached translation for page ${page}`,
     retry: "Retry",
@@ -1276,6 +1280,7 @@ function PageSpread({
           </div>
         </div>
       </div>
+      <ReaderDivider />
       <div className="translated-page page-surface">
         <div className="translation-heading">
           <div className="page-label">{messages.translatedPage(page)}</div>
@@ -3512,7 +3517,8 @@ export default function Home() {
               <p>{messages.rendererFailedHelp}</p>
             </div>
           ) : (
-            <ReaderViewport zoom={readerZoom} onZoom={setReaderZoom} currentPage={currentPage}>
+            <ReaderViewport zoom={readerZoom} onZoom={setReaderZoom} currentPage={currentPage}
+              dividerLabel={messages.readerDivider} dividerValueText={messages.readerDividerValue}>
               {pageNumbers.map((page) => (
                 <PageSpread
                   key={`${documentId}-${page}-${serverBookAvailable ? "server" : "local"}`}

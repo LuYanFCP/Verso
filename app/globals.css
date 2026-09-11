@@ -191,7 +191,13 @@ button { color: inherit; }
 .reader-zoom { display: flex; align-items: center; gap: 2px; white-space: nowrap; }
 .zoom-fit { border: 0; border-radius: 6px; background: transparent; color: var(--muted); font-size: 11px; padding: 6px; cursor: pointer; font-variant-numeric: tabular-nums; }
 .zoom-fit:hover { background: var(--green-soft); }
-.page-spread { position: relative; display: grid; grid-template-columns: 1fr 1fr; min-height: 690px; margin-bottom: 68px; scroll-margin-top: 129px; background: white; box-shadow: 0 8px 30px rgba(36,45,40,.08), 0 1px 3px rgba(36,45,40,.08); border: 1px solid #dfe2dd; }
+.page-spread { position: relative; display: grid; grid-template-columns: var(--reader-source-width, 50%) minmax(0, 1fr); min-height: 690px; margin-bottom: 68px; scroll-margin-top: 129px; background: white; box-shadow: 0 8px 30px rgba(36,45,40,.08), 0 1px 3px rgba(36,45,40,.08); border: 1px solid #dfe2dd; }
+.reader-divider { position: absolute; z-index: 5; top: 0; bottom: 0; left: var(--reader-source-width, 50%); width: calc(24px / var(--reader-scale, 1)); transform: translateX(-50%); cursor: col-resize; touch-action: none; outline: none; }
+.reader-divider::before { content: ""; position: absolute; inset: 0; width: calc(2px / var(--reader-scale, 1)); margin-inline: auto; background: transparent; transition: background-color .15s; }
+.reader-divider > span { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); width: calc(7px / var(--reader-scale, 1)); height: calc(38px / var(--reader-scale, 1)); border: 1px solid var(--line); border-radius: 6px; background: var(--muted); opacity: .55; }
+.reader-divider:hover::before, .reader-divider:focus-visible::before, .reader-viewport[data-resizing] .reader-divider::before { background: var(--green); }
+.reader-divider:hover > span, .reader-divider:focus-visible > span, .reader-viewport[data-resizing] .reader-divider > span { background: var(--green); opacity: 1; }
+.reader-resizing, .reader-resizing * { cursor: col-resize !important; user-select: none !important; }
 .page-surface { min-width: 0; position: relative; background: var(--paper); }
 .source-page { display: flex; align-items: flex-start; justify-content: center; padding: 48px 42px 36px; border-right: 1px solid #d5dad5; background: #ecebe5; overflow: hidden; }
 .source-page img, .source-page canvas { width: 100%; height: auto; display: block; box-shadow: 0 3px 12px rgba(34,40,36,.15); filter: saturate(.88) contrast(.98); }
