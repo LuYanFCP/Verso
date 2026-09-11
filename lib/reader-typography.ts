@@ -1,5 +1,5 @@
-export const MIN_TRANSLATION_FONT_SIZE = 80;
-export const MAX_TRANSLATION_FONT_SIZE = 180;
+export const MIN_TRANSLATION_FONT_SIZE = 50;
+export const MAX_TRANSLATION_FONT_SIZE = 300;
 export const TRANSLATION_FONT_SIZE_STEP = 5;
 
 export type ReaderTypography = {

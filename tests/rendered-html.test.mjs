@@ -41,8 +41,8 @@ test("restores font preferences safely from old or invalid reader settings", () 
   assert.deepEqual(normalizeReaderTypography({ translationFontSize: 145, translationFontFamily: "sans" }), {
     translationFontSize: 145, translationFontFamily: "sans",
   });
-  assert.equal(normalizeReaderTypography({ translationFontSize: -100 }).translationFontSize, 80);
-  assert.equal(normalizeReaderTypography({ translationFontSize: 1000 }).translationFontSize, 180);
+  assert.equal(normalizeReaderTypography({ translationFontSize: -100 }).translationFontSize, 50);
+  assert.equal(normalizeReaderTypography({ translationFontSize: 1000 }).translationFontSize, 300);
   assert.equal(normalizeReaderTypography({ translationFontSize: 127 }).translationFontSize, 125);
 });
 
