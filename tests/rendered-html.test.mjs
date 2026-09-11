@@ -954,6 +954,87 @@ test("grounds sentence highlights in PDF words instead of estimated model rectan
   assert.equal(aligned.fontSize, 0.02);
 });
 
+test("repairs a cached cross-page word without repeating it or losing page-local source mappings", async () => {
+  const { parsePdfWordLayout, alignSourceBlocks } = await import("../lib/source-alignment.ts");
+  const language = "Simplified Chinese";
+  const leading = { kind: "heading", text: "推理系统", spaceBefore: "none" };
+  const boundary = (text, sourceText) => ({ kind: "paragraph", text, sentences: [{ text, sourceText, sourceRects: [] }] });
+  const previousBlocks = [leading, boundary("编码器和解码器", "Encoder and De-")];
+  const currentBlocks = [boundary("的 SWA 有界重放路径。", "coder SWA Bounded Replay paths.")];
+  const requests = [];
+  const provider = createHttpServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const input = JSON.parse(Buffer.concat(chunks).toString());
+    const content = (input.input || input.messages)[0].content;
+    requests.push(content);
+    const needsRevision = content[0].text.includes('The cached translation ends with: "编码器和 De-"');
+    const result = { page: 2, blocks: currentBlocks, sourceSummary: "", previousPageRevision: needsRevision ? { page: 1, blocks: previousBlocks } : null };
+    response.setHeader("Content-Type", "application/json");
+    response.end(JSON.stringify(input.input
+      ? { output_text: JSON.stringify(result) }
+      : { choices: [{ message: { content: JSON.stringify(result) } }] }));
+  });
+  await new Promise((resolve) => provider.listen(0, "127.0.0.1", resolve));
+  try {
+    for (const [index, format] of ["openai", "compatible"].entries()) {
+      const book = await uploadQueueBook(String(index + 7).repeat(64), 2);
+      const settings = await fetch(`${baseUrl}/api/settings/ai-provider`, {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: format, endpoint: `http://127.0.0.1:${provider.address().port}/${format === "openai" ? "responses" : "v1"}`, apiKey: "test-key", model: "boundary-test", reasoningEffort: "none" }),
+      });
+      assert.equal(settings.status, 200);
+      const seeded = await fetch(`${baseUrl}/api/translations`, {
+        method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ key: translationCacheKey(book.fingerprint, 1, language), documentId: book.fingerprint, page: 1,
+          translation: { page: 1, blocks: [leading, boundary("编码器和 De-", "Encoder and De-")] } }),
+      });
+      assert.equal(seeded.status, 200);
+      const response = await readTestPage(book, 2, { targetLanguage: language, contextPages: [1, 2] });
+      assert.equal(response.status, 200);
+      const result = await response.json();
+      const instruction = requests.at(-1)[0].text;
+      assert.match(instruction, /belongs in full to the page where it starts/);
+      assert.match(instruction, /even when neither page is cached yet/);
+      assert.match(instruction, /Preserve genuine compound hyphens/);
+      assert.match(instruction, /its cached translation left a split word incomplete/);
+      assert.deepEqual(requests.at(-1).filter((part) => /^Page \d+:$/.test(part.text || "")).map((part) => part.text), ["Page 1:", "Page 2:"]);
+      assert.equal(result.previousPageRevision.page, 1);
+
+      const cached = [];
+      for (const page of [1, 2]) {
+        const reread = await readTestPage(book, page, { targetLanguage: language });
+        assert.equal(reread.status, 200);
+        cached.push(await reread.json());
+      }
+      assert.deepEqual(cached[0].blocks, normalizeTranslationPayload({ blocks: previousBlocks }).blocks);
+      assert.deepEqual(cached[1].blocks, normalizeTranslationPayload({ blocks: currentBlocks }).blocks);
+      assert.equal(cached[0].cacheVersion, cached[1].cacheVersion);
+      assert.equal(cached[0].blocks.at(-1).text + cached[1].blocks[0].text, "编码器和解码器的 SWA 有界重放路径。");
+      assert.equal(cached[0].markdown, "推理系统\n\n编码器和解码器");
+      assert.equal(requests.length, index * 2 + 1);
+
+      // A complete translated word still highlights only the fragment on its own scan.
+      for (const [page, sourceText, y] of [[0, "Encoder and De-", 700], [1, "coder SWA Bounded Replay paths.", 80]]) {
+        const words = sourceText.split(" ").map((word, position) => `<word xMin="${60 + position * 80}" yMin="${y}" xMax="${130 + position * 80}" yMax="${y + 12}">${word}</word>`).join("");
+        const layout = parsePdfWordLayout(`<page width="600" height="800"><line>${words}</line></page>`);
+        const blocks = alignSourceBlocks(cached[page].blocks, layout);
+        const sentence = blocks.find((block) => block.kind === "paragraph").sentences[0];
+        assert.equal(sentence.sourceText, sourceText);
+        assert.equal(sentence.sourceRects.length, 1);
+        assert.equal(sentence.sourceRects[0].y, y / 800);
+      }
+      const repeated = await readTestPage(book, 2, { targetLanguage: language, contextPages: [1, 2], force: true });
+      assert.equal(repeated.status, 200);
+      assert.equal((await repeated.json()).previousPageRevision, null);
+      assert.match(requests.at(-1)[0].text, /The cached translation ends with: "编码器和解码器"/);
+    }
+  } finally {
+    provider.closeAllConnections();
+    await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
 test("preserves equation typography while grounding highlights in small math glyphs", async () => {
   const { parsePdfWordLayout, alignSourceBlocks } = await import("../lib/source-alignment.ts");
   const layout = parsePdfWordLayout(`<page width="600" height="800"><line>
