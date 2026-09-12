@@ -1,6 +1,10 @@
 "use client";
 /* eslint-disable @next/next/no-img-element */
 
+import { useQueueFeedback } from "./queue-feedback";
+import { isTranslationActive, type BookTranslationJob } from "../lib/translation-queue";
+import { readTranslationResponse, type TranslationProgress } from "../lib/translation-progress";
+import { recordClientTiming, recordTranslationTrace, type TranslationTrace } from "../lib/translation-trace";
 import {
   BookOpen,
   ChevronDown,
@@ -12,11 +16,11 @@ import {
   Globe2,
   Languages,
   ListTree,
+  ListOrdered,
   LoaderCircle,
   Menu,
   Minus,
   MoreHorizontal,
-  Moon,
   PanelLeftClose,
   Plus,
   RefreshCw,
@@ -24,19 +28,18 @@ import {
   Search,
   Settings2,
   Sparkles,
-  Sun,
   Trash2,
   Upload,
   X,
 } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from "react";
-import {
-  DEFAULT_AI_PROVIDER_SETTINGS,
-  type AiProvider,
-  type AiProviderSettingsUpdate,
-  type PublicAiProviderSettings,
-  type ReasoningEffort,
-} from "../lib/ai-provider-settings";
+import Link from "next/link";
+import { useRouter } from "next/navigation";
+import { DEFAULT_SETTINGS, type TranslationSettings } from "../lib/app-settings";
+import { UI_MESSAGES, targetLanguageLabel, type UiMessages } from "../lib/ui-messages";
+import { useAppSettings } from "./app-settings";
+import { Brand } from "./brand";
+import { ThemeSelect } from "./theme-select";
 import { LOCAL_PDF_RANGE_CHUNK_SIZE, createLocalPdfRangeTransport } from "../lib/local-pdf-range-transport";
 import { createConcurrencyLimiter } from "../lib/concurrency-limiter";
 import {
@@ -56,14 +59,13 @@ import { isDocumentSearchShortcut } from "../lib/keyboard-shortcuts";
 import { deduplicatePageBoundary, hasLayoutContent, normalizeTranslationPayload, type LayoutBlock, type SourceRect } from "../lib/translation-layout";
 import { searchTranslationPayload } from "../lib/translation-search";
 import { groupTranslationMedia, imagePlacement } from "../lib/translation-media";
-import { DEFAULT_TYPEWRITER_CHARACTERS_PER_SECOND, typewriterProgress } from "../lib/translation-typewriter";
+import { typewriterProgress } from "../lib/translation-typewriter";
 import type { UiLocale } from "../lib/ui-locale";
 import { pageWorkWindow, isPageWorkEnabled, shouldStartTranslationRequest } from "../lib/viewport-work";
 import { useUiLocale } from "./ui-locale";
 import { SourceImageCrop } from "./source-image-crop";
-import { ReaderDivider, ReaderViewport, READER_PAGE_WIDTH, MIN_READER_ZOOM, MAX_READER_ZOOM } from "./reader-viewport";
+import { ReaderDivider, ReaderViewport, ReaderZoomProvider, ReaderZoomControls, READER_PAGE_WIDTH } from "./reader-viewport";
 import { ReaderFontControls } from "./reader-font-controls";
-import { DEFAULT_READER_TYPOGRAPHY, normalizeReaderTypography, type ReaderTypography } from "../lib/reader-typography";
 import { alignSourceBlocks, type SourcePageLayout } from "../lib/source-alignment";
 import { DisplayEquation, MathText } from "./math-content";
 import { translationCacheKey, translationCacheSuffix } from "../lib/translation-cache";
@@ -96,23 +98,6 @@ async function loadPdfRuntime() {
   }
   return { pdfjs, worker: await pdfWorkerPromise };
 }
-
-type TranslationSettings = {
-  targetLanguage: string;
-  translationConcurrency: number;
-};
-
-type AppSettings = TranslationSettings & ReaderTypography & {
-  schemaVersion: number;
-  nearbyPages: number;
-  smoothScrolling: boolean;
-  translationAnimation: boolean;
-  translationAnimationSpeed: number;
-};
-
-type TranslationService = PublicAiProviderSettings & {
-  loaded: boolean;
-};
 
 type LocalBook = {
   id: string;
@@ -154,384 +139,6 @@ type TranslationSource = "cache" | "api";
 type SearchMatch = {
   page: number;
   snippet: string;
-};
-
-const UI_MESSAGES = {
-  "zh-CN": {
-    blankPage: "此页没有可翻译文本",
-    blankCached: "空白页已保存到本机",
-    boundaryFixed: "跨页重复已校正 · 已保存到本机",
-    revised: "已结合下一页修订 · 已保存到本机",
-    cachedLayout: "译文已保存到本机 · 保留原文结构",
-    cached: "译文已保存到本机",
-    sourcePage: (page: number) => `原文 · ${page}`,
-    translatedPage: (page: number) => `译文 · ${page}`,
-    scannedSourceAlt: (page: number) => `扫描原文第 ${page} 页`,
-    sampleScanAlt: (page: number) => `示例扫描页第 ${page} 页`,
-    pageDivider: (page: number) => `第 ${page} 页`,
-    scanFailed: "扫描页渲染失败",
-    retryRender: "重试渲染",
-    renderingScan: "正在渲染扫描页",
-    retranslate: "重新翻译本页",
-    restartTranslation: "停止当前任务并重新翻译本页",
-    zoomIn: "放大阅读视图",
-    zoomOut: "缩小阅读视图",
-    fitWidth: "适应宽度",
-    readerZoom: "阅读视图缩放",
-    readerFont: {
-      label: "字体", title: "译文字体", size: "字号", decrease: "缩小译文字号", increase: "放大译文字号",
-      family: "字体样式", serif: "衬线", sans: "无衬线", reset: "恢复默认", close: "关闭字体设置",
-    },
-    readerDivider: "拖动调整原文和译文宽度；双击或按 Enter 恢复对半，方向键微调",
-    readerDividerValue: (percent: number) => `原文 ${percent}%，译文 ${100 - percent}%`,
-    readingContext: (page: number) => `正在读取第 ${page} 页及相邻上下文`,
-    loadingCachedTranslation: (page: number) => `正在载入第 ${page} 页的缓存译文`,
-    retry: "重试",
-    settingsDialog: "设置",
-    settings: "设置",
-    settingsSubtitle: "阅读体验与视觉翻译设置",
-    closeSettings: "关闭设置",
-    serverProvider: "服务端 AI Provider",
-    serverProviderReady: (model: string) => `已保存在服务端 SQLite${model ? ` · ${model}` : ""}`,
-    serverProviderMissing: "尚未配置。保存以下服务端配置后即可翻译。",
-    provider: "Provider",
-    openaiProvider: "OpenAI",
-    compatibleProvider: "OpenAI Compatible",
-    apiEndpoint: "API Endpoint",
-    apiKey: "API Key",
-    apiKeyPlaceholder: "输入新的 API Key",
-    apiKeyHelp: "密钥只保存在服务端 SQLite；读取设置时不会返回浏览器。留空可保留现有密钥。",
-    model: "Model",
-    reasoningEffort: "Reasoning Effort",
-    saveProvider: "保存 AI Provider",
-    savingProvider: "正在保存…",
-    providerSaved: "服务端 AI 配置已保存。",
-    providerSaveFailed: "无法保存服务端 AI 配置。",
-    targetLanguage: "目标语言",
-    prefetchRange: (pages: number) => `预取范围 · 前后 ${pages} 页`,
-    parallelTranslation: (pages: number) => `并行翻译 · 同时 ${pages} 页`,
-    concurrencyHelp: "默认 4；如果 Provider 返回限流错误，可以适当调低。",
-    crossPageEnabled: "跨页上下文已启用",
-    crossPageHelp: "每次最多向模型发送连续 3 页；后页可修订上一页未闭合的段落。",
-    smoothScrolling: "平滑滚动",
-    smoothScrollingHelp: "目录跳转和翻页时播放滚动动画",
-    translationAnimation: "渐变打字效果",
-    translationAnimationHelp: "仅在 API 生成新译文时播放；缓存译文直接显示。",
-    translationAnimationSpeed: (speed: number) => `动画速度 · ${speed} 字/秒`,
-    discardBookTranslations: "清空所有译文",
-    confirmDiscardBookTranslations: "再次点击，确认清空",
-    discardBookTranslationsHelp: "清空本书所有目标语言的译文，并停止后台翻译。",
-    cancelDiscardBookTranslations: "取消",
-    discardTranslations: "丢弃本书全部译文",
-    discardTranslationsHelp: "删除这本书所有目标语言的本地译文缓存，不影响 PDF、目录和页码索引。",
-    discardTranslationsConfirm: (name: string) => `确定丢弃《${name}》的全部译文缓存吗？此操作无法撤销。`,
-    discardingTranslations: "正在丢弃…",
-    translationsDiscarded: (count: number) => `已丢弃 ${count} 页缓存译文。`,
-    discardTranslationsFailed: "无法丢弃本书的译文缓存。",
-    saveSettings: "保存设置",
-    localLibrary: "本地书库",
-    translateBook: "后台翻译整本书",
-    translateBookAction: "翻译整本书",
-    translatingBookAction: "翻译中",
-    translatedBookAction: "已翻译",
-    retryBookAction: "重试翻译",
-    queuePending: "正在加入队列…",
-    queueFailed: "翻译失败，点击重试",
-    queueCompleted: "整本翻译完成",
-    queueProgress: (done: number, total: number) => `后台翻译 · ${done} / ${total} 页`,
-    queueReadFailed: "无法读取翻译队列",
-    queueHelp: (language: string) => `译为 ${language} · 关闭页面后继续，阅读优先`,
-    libraryHomeTitle: "你的书库",
-    librarySlogan: "对照原文，跨越语言阅读。",
-    bookCoverAlt: (name: string) => `${name} 的封面`,
-    openBook: (name: string) => `打开《${name}》`,
-    uploadPdf: "上传新 PDF",
-    bookCount: (count: number) => `${count} 本`,
-    loadingLibrary: "正在读取书库",
-    bookMeta: (pages: number, size: string, date: string) => `${pages} 页 · ${size} · ${date}`,
-    noBooks: "还没有本地书籍",
-    noBooksHelp: "上传 PDF 后会自动出现在这里。",
-    openLibrary: "打开本地书库",
-    localProgress: (progress: number) => `本地保存 ${progress}%`,
-    localCached: "已保存到本机",
-    openPdf: "打开 PDF",
-    toggleSidebar: "切换侧栏",
-    pages: "页码",
-    contents: "目录",
-    searchPages: "搜索页码",
-    searchPlaceholder: "搜索译文",
-    searchResults: (count: number) => `${count} 条结果`,
-    searching: "正在搜索已翻译页面",
-    noSearchResults: "未找到匹配内容",
-    searchFailed: "无法搜索已翻译内容",
-    contentsCount: (count: number) => `${count} 项`,
-    contentsEmpty: "尚未检测到目录",
-    contentsEmptyHelp: "阅读到目录页并生成译文后，目录会自动出现在这里。",
-    pageOffset: "PDF 页码偏移",
-    automaticOffset: (offset: string) => `自动 ${offset}`,
-    manualOffset: (offset: string) => `手动 ${offset}`,
-    offsetUncalibrated: "尚未校准",
-    offsetHelp: "书内页码 + 偏移 = PDF 页码；读取带页码的正文后会自动计算。",
-    offsetInput: "PDF 页码偏移量",
-    decreaseOffset: "减小页码偏移",
-    increaseOffset: "增大页码偏移",
-    resetAutomaticOffset: "恢复自动计算",
-    tocTarget: (page: number) => `跳转到 PDF 第 ${page} 页`,
-    tocIndexConfirmed: "索引已校准",
-    tocIndexPending: "索引待校准",
-    scannedEdition: (pages: number) => `${pages} 页 · 扫描版`,
-    readingProgress: "阅读进度",
-    page: (page: number) => `第 ${page} 页`,
-    previousPage: "上一页",
-    nextPage: "下一页",
-    sourceScan: "原文扫描",
-    moreOptions: "更多选项",
-    closeError: "关闭错误提示",
-    pdfReady: "PDF 已加载，但服务端尚未配置 AI Provider。",
-    openSettings: "打开设置",
-    localIndex: (pages: number) => `已载入本地页码索引 · ${pages} 页`,
-    readingIndex: "正在读取 PDF 页码索引",
-    connectingRenderer: (name: string) => `已切换到《${name}》，正在连接页面渲染器`,
-    rendererFailed: "页面渲染器连接失败",
-    rendererFailedHelp: "请从本地书库重新选择，或重新打开 PDF。",
-    contextWindow: "上下文窗口",
-    pageRange: (start: number, end: number) => `第 ${start}–${end} 页`,
-    switchLanguage: "Switch interface to English",
-    switchTheme: "切换明暗模式",
-    libraryReadFailed: "无法读取本地书库",
-    preparingLocal: "正在准备本地存储",
-    localBookReused: "本机已有此书，已直接复用",
-    uploadSessionMissing: "无法创建本地上传会话",
-    partFailed: (part: number) => `分片 ${part} 上传失败`,
-    cachingParts: (completed: number, total: number) => `正在保存到本机 · ${completed}/${total}`,
-    uploadCompleteFailed: "无法完成本地保存",
-    cachedLocal: "已保存到本机",
-    uploadFailed: "本地保存失败",
-    apiKeyRequired: "服务端尚未配置 AI Provider。",
-    invalidTranslation: "模型返回了无效的译文结构。",
-    translationFailed: "无法生成译文",
-    localTranslationReadFailed: "无法读取本地译文缓存",
-    localTranslationWriteFailed: "无法写入本地译文缓存",
-    localTranslationDiscardFailed: "无法删除本地译文缓存",
-    navigationReadFailed: "无法读取本地目录",
-    navigationWriteFailed: "无法写入本地目录",
-    translationRequestFailed: "翻译请求失败",
-    translationCacheHit: "已从本地译文缓存载入",
-    translationApiSucceeded: "API 翻译成功",
-    translationInProgress: "正在读取或生成译文",
-    openPdfFailed: (detail: string) => `无法打开这个 PDF：${detail}`,
-    openedFromLocal: "已从本地书库打开",
-    openLocalFailed: (detail: string) => `无法打开本地 PDF：${detail}`,
-  },
-  "en-US": {
-    blankPage: "No translatable text on this page",
-    blankCached: "Blank page saved locally",
-    boundaryFixed: "Cross-page overlap fixed · Saved locally",
-    revised: "Revised with the next page · Saved locally",
-    cachedLayout: "Translation saved locally · Source structure preserved",
-    cached: "Translation saved locally",
-    sourcePage: (page: number) => `Source · ${page}`,
-    translatedPage: (page: number) => `Translation · ${page}`,
-    scannedSourceAlt: (page: number) => `Scanned source page ${page}`,
-    sampleScanAlt: (page: number) => `Sample scanned page ${page}`,
-    pageDivider: (page: number) => `Page ${page}`,
-    scanFailed: "Failed to render scanned page",
-    retryRender: "Retry rendering",
-    renderingScan: "Rendering scanned page",
-    retranslate: "Translate this page again",
-    restartTranslation: "Stop the current task and translate this page again",
-    zoomIn: "Zoom in reading view",
-    zoomOut: "Zoom out reading view",
-    fitWidth: "Fit width",
-    readerZoom: "Reading view zoom",
-    readerFont: {
-      label: "Font", title: "Translation font", size: "Font size", decrease: "Decrease translation font size", increase: "Increase translation font size",
-      family: "Font style", serif: "Serif", sans: "Sans serif", reset: "Reset to default", close: "Close font settings",
-    },
-    readerDivider: "Drag to resize source and translation; double-click or press Enter to reset, arrow keys to adjust",
-    readerDividerValue: (percent: number) => `Source ${percent}%, translation ${100 - percent}%`,
-    readingContext: (page: number) => `Reading page ${page} and adjacent context`,
-    loadingCachedTranslation: (page: number) => `Loading cached translation for page ${page}`,
-    retry: "Retry",
-    settingsDialog: "Settings",
-    settings: "Settings",
-    settingsSubtitle: "Reading and vision translation preferences",
-    closeSettings: "Close settings",
-    serverProvider: "Server AI provider",
-    serverProviderReady: (model: string) => `Stored in server-side SQLite${model ? ` · ${model}` : ""}`,
-    serverProviderMissing: "Not configured. Save the server settings below to enable translation.",
-    provider: "Provider",
-    openaiProvider: "OpenAI",
-    compatibleProvider: "OpenAI Compatible",
-    apiEndpoint: "API Endpoint",
-    apiKey: "API Key",
-    apiKeyPlaceholder: "Enter a new API key",
-    apiKeyHelp: "The key is stored only in server-side SQLite and is never returned when settings are read. Leave blank to keep the current key.",
-    model: "Model",
-    reasoningEffort: "Reasoning effort",
-    saveProvider: "Save AI provider",
-    savingProvider: "Saving…",
-    providerSaved: "Server AI settings saved.",
-    providerSaveFailed: "Unable to save server AI settings.",
-    targetLanguage: "Target language",
-    prefetchRange: (pages: number) => `Prefetch range · ${pages} page${pages === 1 ? "" : "s"} before and after`,
-    parallelTranslation: (pages: number) => `Parallel translation · ${pages} page${pages === 1 ? "" : "s"}`,
-    concurrencyHelp: "Default: 4. Lower this if your provider returns rate-limit errors.",
-    crossPageEnabled: "Cross-page context enabled",
-    crossPageHelp: "Each request includes at most 3 consecutive pages; a later page may revise an unfinished paragraph.",
-    smoothScrolling: "Smooth scrolling",
-    smoothScrollingHelp: "Animate page and contents navigation",
-    translationAnimation: "Gradient typewriter effect",
-    translationAnimationHelp: "Play only for new API translations; show cached translations immediately.",
-    translationAnimationSpeed: (speed: number) => `Animation speed · ${speed} chars/s`,
-    discardBookTranslations: "Drop all translations",
-    confirmDiscardBookTranslations: "Click again to confirm",
-    discardBookTranslationsHelp: "Clear translations in every target language and stop background translation for this book.",
-    cancelDiscardBookTranslations: "Cancel",
-    discardTranslations: "Discard all translations for this book",
-    discardTranslationsHelp: "Delete cached translations in every target language for this book. The PDF, contents, and page index are preserved.",
-    discardTranslationsConfirm: (name: string) => `Discard every cached translation for “${name}”? This cannot be undone.`,
-    discardingTranslations: "Discarding…",
-    translationsDiscarded: (count: number) => `Discarded cached translations for ${count} page${count === 1 ? "" : "s"}.`,
-    discardTranslationsFailed: "Unable to discard translations for this book.",
-    saveSettings: "Save settings",
-    localLibrary: "Local Library",
-    translateBook: "Translate entire book",
-    translateBookAction: "Translate book",
-    translatingBookAction: "Translating",
-    translatedBookAction: "Translated",
-    retryBookAction: "Retry translation",
-    queuePending: "Adding to queue…",
-    queueFailed: "Translation failed · Retry",
-    queueCompleted: "Book translation complete",
-    queueProgress: (done: number, total: number) => `Translating · ${done} / ${total} pages`,
-    queueReadFailed: "Unable to read translation queue",
-    queueHelp: (language: string) => `Into ${language} · Continues after closing, reading takes priority`,
-    libraryHomeTitle: "Your library",
-    librarySlogan: "See the original. Read beyond language.",
-    bookCoverAlt: (name: string) => `Cover of ${name}`,
-    openBook: (name: string) => `Open ${name}`,
-    uploadPdf: "Upload a new PDF",
-    bookCount: (count: number) => `${count} book${count === 1 ? "" : "s"}`,
-    loadingLibrary: "Loading library",
-    bookMeta: (pages: number, size: string, date: string) => `${pages} pages · ${size} · ${date}`,
-    noBooks: "No local books yet",
-    noBooksHelp: "Uploaded PDFs will appear here.",
-    openLibrary: "Open local library",
-    localProgress: (progress: number) => `Local save ${progress}%`,
-    localCached: "Saved locally",
-    openPdf: "Open PDF",
-    toggleSidebar: "Toggle sidebar",
-    pages: "Pages",
-    contents: "Contents",
-    searchPages: "Search pages",
-    searchPlaceholder: "Search translations",
-    searchResults: (count: number) => `${count} result${count === 1 ? "" : "s"}`,
-    searching: "Searching translated pages",
-    noSearchResults: "No matching text found",
-    searchFailed: "Unable to search translated content",
-    contentsCount: (count: number) => `${count} item${count === 1 ? "" : "s"}`,
-    contentsEmpty: "No contents detected yet",
-    contentsEmptyHelp: "Contents appear here automatically after a contents page is translated.",
-    pageOffset: "PDF page offset",
-    automaticOffset: (offset: string) => `Auto ${offset}`,
-    manualOffset: (offset: string) => `Manual ${offset}`,
-    offsetUncalibrated: "Not calibrated",
-    offsetHelp: "Printed page + offset = PDF page. Reading numbered body pages calibrates it automatically.",
-    offsetInput: "PDF page offset",
-    decreaseOffset: "Decrease page offset",
-    increaseOffset: "Increase page offset",
-    resetAutomaticOffset: "Restore automatic calculation",
-    tocTarget: (page: number) => `Go to PDF page ${page}`,
-    tocIndexConfirmed: "Index calibrated",
-    tocIndexPending: "Index pending",
-    scannedEdition: (pages: number) => `${pages} pages · Scanned edition`,
-    readingProgress: "Reading progress",
-    page: (page: number) => `Page ${page}`,
-    previousPage: "Previous page",
-    nextPage: "Next page",
-    sourceScan: "Source scan",
-    moreOptions: "More options",
-    closeError: "Dismiss error",
-    pdfReady: "PDF loaded, but the AI provider is not configured on the server.",
-    openSettings: "Open settings",
-    localIndex: (pages: number) => `Local page index loaded · ${pages} pages`,
-    readingIndex: "Reading PDF page index",
-    connectingRenderer: (name: string) => `Switched to “${name}”; connecting the page renderer`,
-    rendererFailed: "Page renderer connection failed",
-    rendererFailedHelp: "Select the book again from the local library or reopen the PDF.",
-    contextWindow: "Context window",
-    pageRange: (start: number, end: number) => `Pages ${start}–${end}`,
-    switchLanguage: "切换界面为简体中文",
-    switchTheme: "Toggle light or dark mode",
-    libraryReadFailed: "Unable to read the local library",
-    preparingLocal: "Preparing local storage",
-    localBookReused: "This book is already stored locally and will be reused",
-    uploadSessionMissing: "Unable to create a local upload session",
-    partFailed: (part: number) => `Failed to upload part ${part}`,
-    cachingParts: (completed: number, total: number) => `Saving locally · ${completed}/${total}`,
-    uploadCompleteFailed: "Unable to complete local save",
-    cachedLocal: "Saved locally",
-    uploadFailed: "Local save failed",
-    apiKeyRequired: "The AI provider is not configured on the server.",
-    invalidTranslation: "The model returned an invalid translation structure.",
-    translationFailed: "Unable to generate translation",
-    localTranslationReadFailed: "Unable to read the local translation cache",
-    localTranslationWriteFailed: "Unable to write the local translation cache",
-    localTranslationDiscardFailed: "Unable to delete the local translation cache",
-    navigationReadFailed: "Unable to read local contents",
-    navigationWriteFailed: "Unable to write local contents",
-    translationRequestFailed: "Translation request failed",
-    translationCacheHit: "Loaded from the local translation cache",
-    translationApiSucceeded: "API translation succeeded",
-    translationInProgress: "Loading or generating translation",
-    openPdfFailed: (detail: string) => `Unable to open this PDF: ${detail}`,
-    openedFromLocal: "Opened from local library",
-    openLocalFailed: (detail: string) => `Unable to open local PDF: ${detail}`,
-  },
-} as const;
-
-type UiMessages = (typeof UI_MESSAGES)[UiLocale];
-type ThemeMode = "light" | "dark";
-
-function targetLanguageLabel(value: string, locale: UiLocale) {
-  const labels: Record<UiLocale, Record<string, string>> = {
-    "zh-CN": {
-      "Simplified Chinese": "简体中文",
-      "Traditional Chinese": "繁體中文",
-      English: "English",
-      Japanese: "日本語",
-      Spanish: "Español",
-    },
-    "en-US": {
-      "Simplified Chinese": "Simplified Chinese",
-      "Traditional Chinese": "Traditional Chinese",
-      English: "English",
-      Japanese: "Japanese",
-      Spanish: "Spanish",
-    },
-  };
-  return labels[locale][value] || value;
-}
-
-const DEFAULT_SETTINGS: AppSettings = {
-  ...DEFAULT_READER_TYPOGRAPHY,
-  schemaVersion: 2,
-  targetLanguage: "Simplified Chinese",
-  nearbyPages: 2,
-  translationConcurrency: 4,
-  smoothScrolling: true,
-  translationAnimation: true,
-  translationAnimationSpeed: DEFAULT_TYPEWRITER_CHARACTERS_PER_SECOND,
-};
-
-const EMPTY_TRANSLATION_SERVICE: TranslationService = {
-  ...DEFAULT_AI_PROVIDER_SETTINGS,
-  loaded: false,
-  configured: false,
-  apiKeyConfigured: false,
-  apiKeyHint: "",
-  updatedAt: 0,
 };
 
 const translationLimiter = createConcurrencyLimiter();
@@ -1082,13 +689,25 @@ function TranslationText({
   );
 }
 
-function TranslationSkeleton({ page, messages, cached }: { page: number; messages: UiMessages; cached: boolean }) {
+function TranslationLiveProgress({ progress, messages }: { progress: TranslationProgress; messages: UiMessages }) {
+  const phase = progress.phase;
+  return <div className="translation-live" role="status" aria-live="polite" aria-atomic="true" title={messages.translationStatsHelp}>
+    <span className="translation-live-phase"><LoaderCircle className="spin" size={12} />{messages.translationPhases[phase]}</span>
+    <span className="translation-live-counts">
+      {(progress?.tokens ?? 0).toLocaleString()} tok
+      <span aria-hidden="true"> · </span>{(progress?.characters ?? 0).toLocaleString()} char
+      <span aria-hidden="true"> · </span>{progress?.tokensPerSecond === undefined ? "—" : progress.tokensPerSecond.toFixed(1)} TPS
+    </span>
+  </div>;
+}
+
+function TranslationSkeleton({ page, messages, cached, showStatus = true }: { page: number; messages: UiMessages; cached: boolean; showStatus?: boolean }) {
   return (
     <div className="translation-skeleton">
-      <div className="ai-working">
+      {showStatus && <div className="ai-working">
         {cached ? <HardDrive size={15} /> : <Sparkles size={15} />}
         {cached ? messages.loadingCachedTranslation(page) : messages.readingContext(page)}
-      </div>
+      </div>}
       <i /><i /><i /><i className="short" />
     </div>
   );
@@ -1106,6 +725,7 @@ type PageSpreadProps = {
   animateTranslation: boolean;
   translationAnimationSpeed: number;
   loading: boolean;
+  progress?: TranslationProgress;
   error?: string;
   pageImageUrl?: string;
   pdfReady: boolean;
@@ -1129,6 +749,7 @@ function PageSpread({
   animateTranslation,
   translationAnimationSpeed,
   loading,
+  progress,
   error,
   pageImageUrl,
   pdfReady,
@@ -1172,6 +793,7 @@ function PageSpread({
   const [renderError, setRenderError] = useState("");
   const [renderAttempt, setRenderAttempt] = useState(0);
   const cachedTranslation = translationSource === "cache";
+  const translating = loading && Boolean(progress);
   const finishTranslationAnimation = useCallback(
     () => onTranslationAnimationComplete(page, translation?.cacheVersion),
     [onTranslationAnimationComplete, page, translation?.cacheVersion],
@@ -1297,16 +919,19 @@ function PageSpread({
       <div className="translated-page page-surface">
         <div className="translation-heading">
           <div className="page-label">{messages.translatedPage(page)}</div>
-          {(translation || loading) && (
-            <button
-              className="icon-button subtle"
-              aria-label={loading ? messages.restartTranslation : messages.retranslate}
-              title={loading ? messages.restartTranslation : messages.retranslate}
-              onClick={() => requestTranslation(page, true)}
-            >
-              <RefreshCw className={cn(loading && "spin")} size={15} />
-            </button>
-          )}
+          <div className="translation-heading-actions">
+            {loading && progress && <TranslationLiveProgress progress={progress} messages={messages} />}
+            {(translation || translating) && (
+              <button
+                className="icon-button subtle"
+                aria-label={translating ? messages.restartTranslation : messages.retranslate}
+                title={translating ? messages.restartTranslation : messages.retranslate}
+                onClick={() => requestTranslation(page, true)}
+              >
+                <RefreshCw className={cn(translating && "spin")} size={15} />
+              </button>
+            )}
+          </div>
         </div>
         {translation ? (
           <TranslationText
@@ -1321,255 +946,18 @@ function PageSpread({
             onAnimationComplete={finishTranslationAnimation}
           />
         ) : loading ? (
-          <TranslationSkeleton page={page} messages={messages} cached={cachedTranslation} />
+          <TranslationSkeleton page={page} messages={messages} cached={cachedTranslation} showStatus={false} />
         ) : error ? (
           <div className="translation-error">
             <p>{error}</p>
             <button className="secondary-button" onClick={() => requestTranslation(page, true)}>{messages.retry}</button>
           </div>
         ) : (
-          <TranslationSkeleton page={page} messages={messages} cached={cachedTranslation} />
+          <TranslationSkeleton page={page} messages={messages} cached={cachedTranslation} showStatus={cachedTranslation} />
         )}
       </div>
       {page < totalPages && <div className="spread-divider"><span>{messages.pageDivider(page + 1)}</span></div>}
     </section>
-  );
-}
-
-function SettingsPanel({
-  settings,
-  translationService,
-  currentBookName,
-  canDiscardTranslations,
-  locale,
-  messages,
-  onChange,
-  onProviderSave,
-  onDiscardTranslations,
-  onClose,
-}: {
-  settings: AppSettings;
-  translationService: TranslationService;
-  currentBookName: string;
-  canDiscardTranslations: boolean;
-  locale: UiLocale;
-  messages: UiMessages;
-  onChange: (next: AppSettings) => void;
-  onProviderSave: (settings: AiProviderSettingsUpdate) => Promise<void>;
-  onDiscardTranslations: () => Promise<number>;
-  onClose: () => void;
-}) {
-  const [provider, setProvider] = useState<AiProvider>(translationService.provider);
-  const [endpoint, setEndpoint] = useState(translationService.endpoint);
-  const [apiKey, setApiKey] = useState("");
-  const [model, setModel] = useState(translationService.model);
-  const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>(translationService.reasoningEffort);
-  const [providerSaving, setProviderSaving] = useState(false);
-  const [providerMessage, setProviderMessage] = useState("");
-  const [providerSaveFailed, setProviderSaveFailed] = useState(false);
-  const [discardingTranslations, setDiscardingTranslations] = useState(false);
-  const [discardMessage, setDiscardMessage] = useState("");
-  const [discardFailed, setDiscardFailed] = useState(false);
-
-  function update<K extends keyof AppSettings>(key: K, value: AppSettings[K]) {
-    onChange({ ...settings, [key]: value });
-  }
-
-  async function saveProvider() {
-    setProviderSaving(true);
-    setProviderMessage("");
-    setProviderSaveFailed(false);
-    try {
-      await onProviderSave({ provider, endpoint, apiKey, model, reasoningEffort });
-      setApiKey("");
-      setProviderMessage(messages.providerSaved);
-    } catch {
-      setProviderSaveFailed(true);
-      setProviderMessage(messages.providerSaveFailed);
-    } finally {
-      setProviderSaving(false);
-    }
-  }
-
-  async function discardTranslations() {
-    if (!window.confirm(messages.discardTranslationsConfirm(currentBookName))) return;
-    setDiscardingTranslations(true);
-    setDiscardMessage("");
-    setDiscardFailed(false);
-    try {
-      const deleted = await onDiscardTranslations();
-      setDiscardMessage(messages.translationsDiscarded(deleted));
-    } catch {
-      setDiscardFailed(true);
-      setDiscardMessage(messages.discardTranslationsFailed);
-    } finally {
-      setDiscardingTranslations(false);
-    }
-  }
-
-  return (
-    <div className="settings-backdrop" role="presentation" onMouseDown={onClose}>
-      <aside className="settings-panel" role="dialog" aria-modal="true" aria-label={messages.settingsDialog} onMouseDown={(event) => event.stopPropagation()}>
-        <div className="settings-title">
-          <div><span>{messages.settings}</span><p>{messages.settingsSubtitle}</p></div>
-          <button className="icon-button" onClick={onClose} aria-label={messages.closeSettings}><X size={18} /></button>
-        </div>
-
-        <div className={cn("server-provider-status", translationService.configured ? "ready" : "missing")}>
-          <HardDrive size={17} />
-          <div>
-            <strong>{messages.serverProvider}</strong>
-            <p>
-              {translationService.configured
-                ? messages.serverProviderReady(translationService.model)
-                : messages.serverProviderMissing}
-            </p>
-          </div>
-        </div>
-
-        <label className="field-label">{messages.provider}</label>
-        <div className="segmented">
-          {(["openai", "compatible"] as const).map((value) => (
-            <button
-              type="button"
-              key={value}
-              className={cn(provider === value && "active")}
-              onClick={() => {
-                setProvider(value);
-                if (value === "openai" && !endpoint.trim()) setEndpoint(DEFAULT_AI_PROVIDER_SETTINGS.endpoint);
-              }}
-            >
-              {value === "openai" ? messages.openaiProvider : messages.compatibleProvider}
-            </button>
-          ))}
-        </div>
-
-        <label className="field-label" htmlFor="api-endpoint">{messages.apiEndpoint}</label>
-        <input id="api-endpoint" type="url" value={endpoint} onChange={(event) => setEndpoint(event.target.value)} />
-
-        <label className="field-label" htmlFor="api-key">{messages.apiKey}</label>
-        <input
-          id="api-key"
-          type="password"
-          autoComplete="new-password"
-          value={apiKey}
-          placeholder={translationService.apiKeyHint || messages.apiKeyPlaceholder}
-          onChange={(event) => setApiKey(event.target.value)}
-        />
-        <p className="field-help">{messages.apiKeyHelp}</p>
-
-        <div className="field-grid">
-          <div>
-            <label className="field-label" htmlFor="ai-model">{messages.model}</label>
-            <input id="ai-model" value={model} onChange={(event) => setModel(event.target.value)} />
-          </div>
-          <div>
-            <label className="field-label" htmlFor="reasoning-effort">{messages.reasoningEffort}</label>
-            <select
-              id="reasoning-effort"
-              value={reasoningEffort}
-              onChange={(event) => setReasoningEffort(event.target.value as ReasoningEffort)}
-            >
-              {(["none", "low", "medium", "high", "xhigh", "max"] as const).map((effort) => (
-                <option key={effort} value={effort}>{effort}</option>
-              ))}
-            </select>
-          </div>
-        </div>
-        <button
-          type="button"
-          className="secondary-button full provider-save-button"
-          disabled={providerSaving}
-          onClick={() => void saveProvider()}
-        >
-          {providerSaving ? messages.savingProvider : messages.saveProvider}
-        </button>
-        {providerMessage && (
-          <p className={cn("provider-save-message", providerSaveFailed && "error")}>{providerMessage}</p>
-        )}
-
-        <label className="field-label" htmlFor="language">{messages.targetLanguage}</label>
-        <select id="language" value={settings.targetLanguage} onChange={(event) => update("targetLanguage", event.target.value)}>
-          {Object.keys({
-            "Simplified Chinese": true,
-            "Traditional Chinese": true,
-            English: true,
-            Japanese: true,
-            Spanish: true,
-          }).map((language) => <option key={language} value={language}>{targetLanguageLabel(language, locale)}</option>)}
-        </select>
-
-        <label className="field-label" htmlFor="nearby">{messages.prefetchRange(settings.nearbyPages)}</label>
-        <input id="nearby" className="range" type="range" min="1" max="4" value={settings.nearbyPages} onChange={(event) => update("nearbyPages", Number(event.target.value))} />
-
-        <label className="field-label" htmlFor="concurrency">{messages.parallelTranslation(settings.translationConcurrency)}</label>
-        <input id="concurrency" className="range" type="range" min="1" max="6" value={settings.translationConcurrency} onChange={(event) => update("translationConcurrency", Number(event.target.value))} />
-        <p className="field-help">{messages.concurrencyHelp}</p>
-
-        <button
-          type="button"
-          className={cn("setting-switch", settings.smoothScrolling && "active")}
-          role="switch"
-          aria-checked={settings.smoothScrolling}
-          onClick={() => update("smoothScrolling", !settings.smoothScrolling)}
-        >
-          <span><strong>{messages.smoothScrolling}</strong><small>{messages.smoothScrollingHelp}</small></span>
-          <i aria-hidden="true"><span /></i>
-        </button>
-
-        <button
-          type="button"
-          className={cn("setting-switch", settings.translationAnimation && "active")}
-          role="switch"
-          aria-checked={settings.translationAnimation}
-          onClick={() => update("translationAnimation", !settings.translationAnimation)}
-        >
-          <span><strong>{messages.translationAnimation}</strong><small>{messages.translationAnimationHelp}</small></span>
-          <i aria-hidden="true"><span /></i>
-        </button>
-
-        <label className="field-label" htmlFor="translation-animation-speed">
-          {messages.translationAnimationSpeed(settings.translationAnimationSpeed)}
-        </label>
-        <input
-          id="translation-animation-speed"
-          className="range"
-          type="range"
-          min="20"
-          max="120"
-          step="5"
-          disabled={!settings.translationAnimation}
-          value={settings.translationAnimationSpeed}
-          onChange={(event) => update("translationAnimationSpeed", Number(event.target.value))}
-        />
-
-        <div className="context-note">
-          <Sparkles size={16} />
-          <div><strong>{messages.crossPageEnabled}</strong><p>{messages.crossPageHelp}</p></div>
-        </div>
-        {canDiscardTranslations && (
-          <div className="translation-cache-actions">
-            <div>
-              <strong>{messages.discardTranslations}</strong>
-              <p>{messages.discardTranslationsHelp}</p>
-            </div>
-            <button
-              type="button"
-              className="danger-button full"
-              disabled={discardingTranslations}
-              onClick={() => void discardTranslations()}
-            >
-              {discardingTranslations ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}
-              {discardingTranslations ? messages.discardingTranslations : messages.discardTranslations}
-            </button>
-            {discardMessage && (
-              <p className={cn("discard-message", discardFailed && "error")}>{discardMessage}</p>
-            )}
-          </div>
-        )}
-        <button className="primary-button full" onClick={onClose}>{messages.saveSettings}</button>
-      </aside>
-    </div>
   );
 }
 
@@ -1578,7 +966,6 @@ function formatFileSize(size: number) {
   return `${(size / 1024 / 1024).toFixed(size < 10 * 1024 * 1024 ? 1 : 0)} MB`;
 }
 
-type BookTranslationJob = { documentId: string; status: string; error: string | null; completedPages: number; totalPages: number };
 
 function LibraryHome({
   books,
@@ -1591,10 +978,7 @@ function LibraryHome({
   onSelect,
   onUpload,
   onRetry,
-  onOpenSettings,
   onToggleLocale,
-  onToggleTheme,
-  theme,
 }: {
   books: LocalBook[];
   translationSettings: TranslationSettings;
@@ -1606,12 +990,10 @@ function LibraryHome({
   onSelect: (book: LocalBook) => void;
   onUpload: () => void;
   onRetry: () => void;
-  onOpenSettings: () => void;
   onToggleLocale: () => void;
-  onToggleTheme: () => void;
-  theme: ThemeMode;
 }) {
   const [jobs, setJobs] = useState<BookTranslationJob[]>([]);
+  const { setNotice } = useQueueFeedback();
   const [pending, setPending] = useState<Set<string>>(new Set());
   const [queueErrors, setQueueErrors] = useState<Record<string, string>>({});
   const [queueError, setQueueError] = useState("");
@@ -1622,13 +1004,13 @@ function LibraryHome({
   const [discardErrors, setDiscardErrors] = useState<Record<string, string>>({});
   const language = translationSettings.targetLanguage;
   const refreshQueue = useCallback(async (signal?: AbortSignal) => {
-    const response = await fetch(`/api/translation-queue?${new URLSearchParams({ targetLanguage: language })}`, { signal });
+    const response = await fetch("/api/translation-queue", { signal });
     const result = await response.json();
     if (!response.ok) throw new Error(result.error || messages.queueReadFailed);
     if (signal?.aborted) return;
     setJobs(result.jobs);
     setQueueError("");
-  }, [language, messages.queueReadFailed]);
+  }, [messages.queueReadFailed]);
   useEffect(() => {
     const controller = new AbortController();
     setJobs([]);
@@ -1680,6 +1062,7 @@ function LibraryHome({
     }
   };
   const enqueue = async (book: LocalBook) => {
+    setNotice(null);
     setOpenActionsId(null);
     setConfirmDiscardId(null);
     setDiscardMessages((value) => ({ ...value, [book.id]: "" }));
@@ -1688,13 +1071,15 @@ function LibraryHome({
     try {
       const response = await fetch("/api/translation-queue", {
         method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ bookId: book.id, targetLanguage: language, translationConcurrency: translationSettings.translationConcurrency }),
+        body: JSON.stringify({ bookId: book.id, targetLanguage: language }),
       });
       const result = await response.json();
       if (!response.ok) throw new Error(result.error || messages.queueFailed);
       await refreshQueue();
     } catch (error) {
-      setQueueErrors((value) => ({ ...value, [book.id]: error instanceof Error ? error.message : messages.queueFailed }));
+      const detail = error instanceof Error ? error.message : messages.queueFailed;
+      setQueueErrors((value) => ({ ...value, [book.id]: detail }));
+      setNotice({ bookName: book.name, error: detail });
     } finally {
       setPending((value) => { const next = new Set(value); next.delete(book.id); return next; });
     }
@@ -1702,18 +1087,19 @@ function LibraryHome({
   return (
     <>
       <header className="topbar library-topbar">
-        <div className="brand"><div className="brand-mark">V</div><span>Verso</span><em>AI Reader</em></div>
+        <div className="brand"><Brand /></div>
         <div className="top-actions">
+          <Link className="secondary-button queue-link" href="/queue" title={messages.queueTitle} aria-label={messages.queueTitle}><ListOrdered size={16} /><span className="action-label">{messages.queueTitle}</span><span>{jobs.filter((job) => isTranslationActive(job.status)).length || ""}</span></Link>
           <button className="icon-button locale-button" title={messages.switchLanguage} aria-label={messages.switchLanguage} onClick={onToggleLocale}><Globe2 size={16} /><span>{locale === "zh-CN" ? "EN" : "中"}</span></button>
-          <button className="icon-button" title={messages.switchTheme} aria-label={messages.switchTheme} aria-pressed={theme === "dark"} onClick={onToggleTheme}>{theme === "light" ? <Moon size={17} /> : <Sun size={17} />}</button>
-          <button className="secondary-button" onClick={onOpenSettings}><Settings2 size={16} /> {messages.settings}</button>
+          <ThemeSelect compact />
+          <Link className="secondary-button settings-link" href="/settings"><Settings2 size={16} /> {messages.settings}</Link>
           <button className="primary-button" onClick={onUpload}><Plus size={16} /><span className="action-label">{messages.uploadPdf}</span></button>
         </div>
       </header>
       <section className="library-home" aria-labelledby="library-title">
         <div className="library-hero">
           <div>
-            <p>{messages.localLibrary}</p>
+            <p>{messages.library}</p>
             <h1 id="library-title">{messages.libraryHomeTitle}</h1>
             <span>{messages.librarySlogan}</span>
           </div>
@@ -1722,7 +1108,7 @@ function LibraryHome({
         {books.length > 0 && (
           <p className="library-translation-note"><Languages size={14} /><span>{messages.queueHelp(language)}</span></p>
         )}
-        {queueError && <p role="alert" className="queue-error">{queueError}</p>}
+        {queueError && <Link href="/queue" className="book-translate-action">{messages.queueNeedsAttention}</Link>}
         {loading ? (
           <div className="library-home-empty"><LoaderCircle className="spin" size={24} /><strong>{messages.loadingLibrary}</strong></div>
         ) : error ? (
@@ -1735,8 +1121,8 @@ function LibraryHome({
         ) : books.length ? (
           <div className="library-grid">
             {books.map((book) => {
-              const job = jobs.find((value) => value.documentId === book.fingerprint);
-              const active = job?.status === "queued" || job?.status === "running";
+              const job = jobs.find((value) => value.documentId === book.fingerprint && value.targetLanguage === language);
+              const active = isTranslationActive(job?.status);
               const complete = job?.status === "completed" && job.completedPages === job.totalPages;
               return (
               <article className={cn("library-book-card", openActionsId === book.id && "book-actions-open")} key={book.id}>
@@ -1779,7 +1165,7 @@ function LibraryHome({
                     {active || pending.has(book.id) ? <LoaderCircle className="spin" size={14} />
                       : complete ? <CircleCheck size={14} /> : <Languages size={14} />}
                     <span>{pending.has(book.id) || active ? messages.translatingBookAction
-                      : complete ? messages.translatedBookAction : job?.status === "failed" ? messages.retryBookAction : messages.translateBookAction}</span>
+                      : complete ? messages.translatedBookAction : (job?.status === "failed" || job?.status === "partial") ? messages.retryBookAction : job?.status === "stopped" ? messages.queueResume : messages.translateBookAction}</span>
                   </button>
                   <button type="button" className="icon-button book-more-action" id={`book-more-${book.id}`}
                     aria-label={messages.moreOptions} title={messages.moreOptions}
@@ -1816,11 +1202,11 @@ function LibraryHome({
                 </div>
                 {job && !complete && (
                   <div className="book-translation-progress">
-                    <small>{messages.queueProgress(job.completedPages, job.totalPages)}</small>
+                    <small>{messages.queueStatuses[job.status]} · {job.completedPages} / {job.totalPages}</small>
                     <progress max={job.totalPages} value={job.completedPages} aria-label={messages.queueProgress(job.completedPages, job.totalPages)} />
                   </div>
                 )}
-                {(queueErrors[book.id] || job?.error) && <p className="queue-error" role="alert">{queueErrors[book.id] || job?.error}</p>}
+                {(job || queueErrors[book.id]) && <Link href="/queue" className="book-translate-action">{queueErrors[book.id] || job?.status === "failed" || job?.status === "partial" ? messages.queueNeedsAttention : messages.queueView}</Link>}
                 {discardMessages[book.id] && <small role="status">{discardMessages[book.id]}</small>}
                 {discardErrors[book.id] && <p className="queue-error" role="alert">{discardErrors[book.id]}</p>}
               </div>
@@ -1982,47 +1368,20 @@ export default function Home() {
   const sourceAnchorReleaseFrame = useRef<number | undefined>(undefined);
   const translationsRef = useRef<Record<number, Translation>>(DEMO_TRANSLATIONS);
   const translationSourcesRef = useRef<Record<number, TranslationSource>>({});
-  const [settingsOpen, setSettingsOpen] = useState(false);
   const [showLibraryHome, setShowLibraryHome] = useState(true);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [sidebarDrawerOpen, setSidebarDrawerOpen] = useState(false);
   const [readerMenuOpen, setReaderMenuOpen] = useState(false);
-  const [readerZoom, setReaderZoom] = useState(1);
   const [sidebarView, setSidebarView] = useState<SidebarView>("pages");
   const [searchQuery, setSearchQuery] = useState("");
   const [searchMatches, setSearchMatches] = useState<SearchMatch[]>([]);
   const [searchLoading, setSearchLoading] = useState(false);
   const [searchError, setSearchError] = useState("");
   const { locale, setLocale } = useUiLocale();
-  const [theme, setTheme] = useState<ThemeMode>("light");
+  const router = useRouter();
+  const { settings, setSettings, translationService } = useAppSettings();
   const messages = UI_MESSAGES[locale];
   const messagesRef = useRef(messages);
-  const [settings, setSettings] = useState<AppSettings>(() => {
-    if (typeof window === "undefined") return DEFAULT_SETTINGS;
-    const stored = localStorage.getItem("verso-settings");
-    if (!stored) return DEFAULT_SETTINGS;
-    try {
-      const storedSettings = JSON.parse(stored) as Partial<AppSettings>;
-      return {
-        ...DEFAULT_SETTINGS,
-        ...normalizeReaderTypography(storedSettings),
-        targetLanguage: storedSettings.targetLanguage || DEFAULT_SETTINGS.targetLanguage,
-        nearbyPages: Number.isInteger(storedSettings.nearbyPages) ? storedSettings.nearbyPages! : DEFAULT_SETTINGS.nearbyPages,
-        translationConcurrency: Number.isInteger(storedSettings.translationConcurrency)
-          ? storedSettings.translationConcurrency!
-          : DEFAULT_SETTINGS.translationConcurrency,
-        smoothScrolling: storedSettings.smoothScrolling ?? DEFAULT_SETTINGS.smoothScrolling,
-        translationAnimation: storedSettings.translationAnimation ?? DEFAULT_SETTINGS.translationAnimation,
-        translationAnimationSpeed: storedSettings.schemaVersion === DEFAULT_SETTINGS.schemaVersion
-          && Number(storedSettings.translationAnimationSpeed) >= 10
-          ? Number(storedSettings.translationAnimationSpeed)
-          : DEFAULT_TYPEWRITER_CHARACTERS_PER_SECOND,
-      };
-    } catch {
-      return DEFAULT_SETTINGS;
-    }
-  });
-  const [translationService, setTranslationService] = useState<TranslationService>(EMPTY_TRANSLATION_SERVICE);
   const translationSettings = useMemo<TranslationSettings>(() => ({
     targetLanguage: settings.targetLanguage,
     translationConcurrency: settings.translationConcurrency,
@@ -2044,6 +1403,7 @@ export default function Home() {
   const [translations, setTranslations] = useState<Record<number, Translation>>(DEMO_TRANSLATIONS);
   const [translationSources, setTranslationSources] = useState<Record<number, TranslationSource>>({});
   const [translationAnimationVersions, setTranslationAnimationVersions] = useState<Record<number, number>>({});
+  const [translationProgress, setTranslationProgress] = useState<Record<number, TranslationProgress>>({});
   const [loadingPages, setLoadingPages] = useState<Set<number>>(new Set());
   const [errors, setErrors] = useState<Record<number, string>>({});
   const [localBooks, setLocalBooks] = useState<LocalBook[]>([]);
@@ -2066,12 +1426,6 @@ export default function Home() {
   useEffect(() => {
     translationAnimationEnabledRef.current = settings.translationAnimation;
   }, [settings.translationAnimation]);
-
-  const updateSettings = useCallback((next: AppSettings) => {
-    translationAnimationEnabledRef.current = next.translationAnimation;
-    setSettings(next);
-    if (!next.translationAnimation) setTranslationAnimationVersions({});
-  }, []);
 
   const completeTranslationAnimation = useCallback((page: number, cacheVersion?: number) => {
     setTranslationAnimationVersions((existing) => {
@@ -2147,6 +1501,7 @@ export default function Home() {
     for (const controller of translationRequests.current.values()) controller.abort();
     translationRequests.current.clear();
     setLoadingPages(new Set());
+    setTranslationProgress({});
   }, []);
 
   const cancelDocumentWork = useCallback(() => {
@@ -2191,6 +1546,7 @@ export default function Home() {
         setTranslationSources({});
         setTranslationAnimationVersions({});
         setLoadingPages(new Set());
+        setTranslationProgress({});
         setErrors({});
         setSearchMatches([]);
         setSearchError("");
@@ -2230,44 +1586,8 @@ export default function Home() {
   }, []);
 
   useEffect(() => {
-    const detectPreferences = window.setTimeout(() => {
-      setTheme(window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
-    }, 0);
-    return () => window.clearTimeout(detectPreferences);
-  }, []);
-
-  useEffect(() => {
     messagesRef.current = messages;
   }, [messages]);
-
-  useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-  }, [theme]);
-
-  const saveTranslationService = useCallback(async (providerSettings: AiProviderSettingsUpdate) => {
-    const response = await fetch("/api/settings/ai-provider", {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(providerSettings),
-    });
-    const result = await response.json() as PublicAiProviderSettings & { error?: string };
-    if (!response.ok) throw new Error(result.error || "Unable to save translation service settings.");
-    setTranslationService({ ...result, loaded: true });
-  }, []);
-
-  useEffect(() => {
-    const controller = new AbortController();
-    void fetch("/api/settings/ai-provider", { cache: "no-store", signal: controller.signal })
-      .then(async (response) => {
-        const result = await response.json() as PublicAiProviderSettings & { error?: string };
-        if (!response.ok) throw new Error(result.error || "Unable to read translation service status.");
-        setTranslationService({ ...result, loaded: true });
-      })
-      .catch(() => {
-        if (!controller.signal.aborted) setTranslationService({ ...EMPTY_TRANSLATION_SERVICE, loaded: true });
-      });
-    return () => controller.abort();
-  }, []);
 
   useEffect(() => {
     if (!readerMenuOpen) return;
@@ -2318,14 +1638,6 @@ export default function Home() {
   }, [refreshBooks]);
 
   useEffect(() => {
-    localStorage.setItem("verso-settings", JSON.stringify(settings));
-  }, [settings]);
-
-  useEffect(() => {
-    document.documentElement.dataset.smoothScroll = settings.smoothScrolling ? "true" : "false";
-  }, [settings.smoothScrolling]);
-
-  useEffect(() => {
     indexedDB.deleteDatabase("verso-translation-cache");
   }, []);
 
@@ -2334,7 +1646,6 @@ export default function Home() {
       if (isDocumentSearchShortcut(event)) {
         if (showLibraryHome) return;
         event.preventDefault();
-        setSettingsOpen(false);
         setSidebarOpen(true);
         setSidebarDrawerOpen(window.matchMedia("(max-width: 900px)").matches);
         setSidebarView("search");
@@ -2442,7 +1753,6 @@ export default function Home() {
   const openLibrary = useCallback(() => {
     cancelDocumentWork();
     setReaderMenuOpen(false);
-    setSettingsOpen(false);
     setShowLibraryHome(true);
     if (bookIdFromUrl()) updateBookInUrl(null, "push");
     window.scrollTo({ top: 0, behavior: "instant" });
@@ -2523,6 +1833,7 @@ export default function Home() {
     setSearchError("");
     setSearchLoading(false);
     setLoadingPages(new Set());
+    setTranslationProgress({});
     setErrors({});
     setSidebarView("pages");
     setNavigation({ observations: [], manualOffset: null });
@@ -2843,11 +2154,17 @@ export default function Home() {
           });
         }
       }
+      requireCurrentRun();
       if (!translationService.configured) throw new Error(currentMessages.apiKeyRequired);
+      // Cache reads must not appear as queued model requests.
+      setTranslationProgress((existing) => ({ ...existing, [page]: { phase: "queued" } }));
       previousTranslation = await readPreviousTranslation();
       requireCurrentRun();
 
+      const clientQueuedAt = performance.now();
       const payload = await translationLimiter.run(translationSettings.translationConcurrency, async () => {
+        recordClientTiming("queue.client", clientQueuedAt, page);
+        const imagesStartedAt = performance.now();
         requireCurrentRun();
         const contextPages = [page - 1, page, page + 1].filter((value) => value >= 1 && value <= totalPages);
         let imageSource = serverBookAvailable
@@ -2859,10 +2176,14 @@ export default function Home() {
               }))),
             };
         requireCurrentRun();
+        recordClientTiming("images.client", imagesStartedAt, page);
+        const receiveProgress = (progress: TranslationProgress) => {
+          if (isCurrentRun() && !controller.signal.aborted) setTranslationProgress((existing) => ({ ...existing, [page]: progress }));
+        };
         const sendTranslation = (source: typeof imageSource | { images: Array<{ page: number; dataUrl: string }> }) => (
           fetch("/api/translate", {
             method: "POST",
-            headers: { "Content-Type": "application/json" },
+            headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
             body: JSON.stringify({
               targetLanguage: translationSettings.targetLanguage,
               translationConcurrency: translationSettings.translationConcurrency,
@@ -2877,8 +2198,9 @@ export default function Home() {
           })
         );
         let response = await sendTranslation(imageSource);
-        let result = await response.json() as TranslationResponse & { error?: string; code?: string };
-        if (!response.ok && result.code === "PAGE_RENDERER_UNAVAILABLE" && serverBookAvailable) {
+        let result = await readTranslationResponse<TranslationResponse & { error?: string; code?: string; trace?: TranslationTrace }>(response, receiveProgress);
+        if (result.trace) recordTranslationTrace(result.trace);
+        if (result.code === "PAGE_RENDERER_UNAVAILABLE" && serverBookAvailable) {
           requireCurrentRun();
           imageSource = {
             images: await Promise.all(contextPages.map(async (number) => ({
@@ -2888,9 +2210,10 @@ export default function Home() {
           };
           requireCurrentRun();
           response = await sendTranslation(imageSource);
-          result = await response.json() as TranslationResponse & { error?: string; code?: string };
+          result = await readTranslationResponse<TranslationResponse & { error?: string; code?: string; trace?: TranslationTrace }>(response, receiveProgress);
+          if (result.trace) recordTranslationTrace(result.trace);
         }
-        if (!response.ok) throw new Error(result.error || currentMessages.translationRequestFailed);
+        if (!response.ok || result.error) throw new Error(result.error || currentMessages.translationRequestFailed);
         if (!Array.isArray(result.blocks)) throw new Error(currentMessages.invalidTranslation);
         return result;
       }, controller.signal);
@@ -2958,6 +2281,7 @@ export default function Home() {
         translationRequests.current.delete(flightKey);
       }
       if (translationRuns.current.finish(flightKey, runToken) && documentSequence === documentLoadSequence.current) {
+        setTranslationProgress((existing) => { const next = { ...existing }; delete next[page]; return next; });
         setLoadingPages((existing) => {
           const next = new Set(existing);
           next.delete(page);
@@ -3199,6 +2523,27 @@ export default function Home() {
     }
   }, []);
 
+  const openSettings = () => {
+    const returnTo = serverBookAvailable && !showLibraryHome
+      ? `/?book=${encodeURIComponent(documentId)}&page=${currentPage}`
+      : "/";
+    if (returnTo !== "/") window.history.replaceState(window.history.state, "", returnTo);
+    router.push(`/settings?returnTo=${encodeURIComponent(returnTo)}`);
+  };
+
+  useEffect(() => {
+    if (showLibraryHome || !documentReady || loadingDocument || isDemo || documentId !== bookIdFromUrl()) return;
+    const url = new URL(window.location.href);
+    const page = Number(url.searchParams.get("page"));
+    if (!Number.isSafeInteger(page) || page < 1) return;
+    const frame = window.requestAnimationFrame(() => {
+      url.searchParams.delete("page");
+      window.history.replaceState(window.history.state, "", `${url.pathname}${url.search}`);
+      goToPage(page);
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [documentId, documentReady, goToPage, isDemo, loadingDocument, showLibraryHome]);
+
   if (showLibraryHome) {
     return (
       <main className="app-shell library-shell">
@@ -3209,36 +2554,19 @@ export default function Home() {
           messages={messages}
           loading={localBooksLoading}
           error={libraryError}
-          theme={theme}
           onDiscardTranslations={(book) => book.fingerprint === documentIdRef.current
             ? discardCurrentBookTranslations()
             : deleteLocalTranslations(book.fingerprint, messages.localTranslationDiscardFailed)}
           onSelect={(book) => void loadLocalBook(book)}
           onUpload={() => fileInput.current?.click()}
           onRetry={() => void refreshBooks()}
-          onOpenSettings={() => setSettingsOpen(true)}
           onToggleLocale={() => setLocale(locale === "zh-CN" ? "en-US" : "zh-CN")}
-          onToggleTheme={() => setTheme((value) => value === "light" ? "dark" : "light")}
         />
         <input ref={fileInput} type="file" accept="application/pdf" hidden onChange={(event) => {
           const file = event.currentTarget.files?.[0];
           event.currentTarget.value = "";
           void handleFile(file);
         }} />
-        {settingsOpen && (
-          <SettingsPanel
-            settings={settings}
-            translationService={translationService}
-            currentBookName={fileName}
-            canDiscardTranslations={false}
-            locale={locale}
-            messages={messages}
-            onChange={updateSettings}
-            onProviderSave={saveTranslationService}
-            onDiscardTranslations={discardCurrentBookTranslations}
-            onClose={() => setSettingsOpen(false)}
-          />
-        )}
       </main>
     );
   }
@@ -3246,7 +2574,7 @@ export default function Home() {
   return (
     <main className={cn("app-shell", sidebarDrawerOpen && "sidebar-drawer-open")}>
       <header className="topbar">
-        <button className="brand brand-button" onClick={openLibrary} aria-label={messages.openLibrary}><div className="brand-mark">V</div><span>Verso</span><em>AI Reader</em></button>
+        <button className="brand brand-button" onClick={openLibrary} aria-label={messages.openLibrary}><Brand /></button>
         <button className="document-title" onClick={openLibrary} title={messages.openLibrary}><FileText size={16} /><span>{fileName}</span><ChevronDown size={14} /></button>
         <div className="top-actions">
           {uploadProgress !== null && uploadProgress < 100 && (
@@ -3264,9 +2592,9 @@ export default function Home() {
               searchInput.current?.select();
             });
           }}><Search size={17} /></button>
-          <button className="icon-button" title={messages.switchTheme} aria-label={messages.switchTheme} aria-pressed={theme === "dark"} onClick={() => setTheme((value) => value === "light" ? "dark" : "light")}>{theme === "light" ? <Moon size={17} /> : <Sun size={17} />}</button>
-          <button className="secondary-button library-button" onClick={openLibrary}><BookOpen size={16} /> {messages.localLibrary}</button>
-          <button className="secondary-button" onClick={() => setSettingsOpen(true)}><Settings2 size={16} /> {messages.settings}</button>
+          <ThemeSelect compact />
+          <button className="secondary-button library-button" onClick={openLibrary}><BookOpen size={16} /> {messages.library}</button>
+          <button className="secondary-button" onClick={() => openSettings()}><Settings2 size={16} /> {messages.settings}</button>
           <button className="primary-button" onClick={() => fileInput.current?.click()}><Upload size={16} /><span className="action-label">{messages.openPdf}</span></button>
           <input ref={fileInput} type="file" accept="application/pdf" hidden onChange={(event) => {
             const file = event.currentTarget.files?.[0];
@@ -3450,6 +2778,7 @@ export default function Home() {
           )}
         </aside>
 
+        <ReaderZoomProvider>
         <section className="reader">
           <div className="reader-toolbar">
             <div className="reader-toolbar-start">
@@ -3469,13 +2798,8 @@ export default function Home() {
             <div className="column-labels"><span>{messages.sourceScan}</span><i /><span><Languages size={15} /> {targetLanguageLabel(settings.targetLanguage, locale)}</span></div>
             <div className="reader-display-controls">
               <ReaderFontControls value={{ translationFontSize: settings.translationFontSize, translationFontFamily: settings.translationFontFamily }} messages={messages.readerFont}
-                onChange={(typography) => setSettings((previous) => ({ ...previous, ...typography }))} />
-              <div className="reader-zoom" role="group" aria-label={messages.readerZoom}>
-                <button className="icon-button" aria-label={messages.zoomOut} disabled={readerZoom <= MIN_READER_ZOOM} onClick={() => setReaderZoom((value) => Math.max(MIN_READER_ZOOM, value - 0.1))}><Minus size={16} /></button>
-                <button className="zoom-fit" title={messages.fitWidth} onClick={() => setReaderZoom(1)}>{Math.round(readerZoom * 100)}%</button>
-                <button className="icon-button" aria-label={messages.zoomIn} disabled={readerZoom >= MAX_READER_ZOOM} onClick={() => setReaderZoom((value) => Math.min(MAX_READER_ZOOM, value + 0.1))}><Plus size={16} /></button>
-                <button className="zoom-fit" onClick={() => setReaderZoom(1)}>{messages.fitWidth}</button>
-              </div>
+                onChange={(typography) => setSettings({ ...settings, ...typography })} />
+              <ReaderZoomControls messages={messages} />
             </div>
             <div className="reader-menu-anchor" ref={readerMenu}>
               <button
@@ -3496,11 +2820,16 @@ export default function Home() {
                   <button role="menuitem" onClick={() => {
                     setReaderMenuOpen(false);
                     openLibrary();
-                  }}><BookOpen size={17} /><span>{messages.localLibrary}</span></button>
+                  }}><BookOpen size={17} /><span>{messages.library}</span></button>
                   <button role="menuitem" onClick={() => {
                     setReaderMenuOpen(false);
-                    setSettingsOpen(true);
+                    openSettings();
                   }}><Settings2 size={17} /><span>{messages.settings}</span></button>
+                  {!isDemo && <button role="menuitem" onClick={() => {
+                    setReaderMenuOpen(false);
+                    if (!window.confirm(messages.discardTranslationsConfirm(fileName))) return;
+                    void discardCurrentBookTranslations().catch(() => setDocumentError(messages.discardTranslationsFailed));
+                  }}><Trash2 size={17} /><span>{messages.discardTranslations}</span></button>}
                   <button role="menuitem" onClick={() => {
                     setReaderMenuOpen(false);
                     fileInput.current?.click();
@@ -3519,7 +2848,7 @@ export default function Home() {
           {!isDemo && !loadingDocument && translationService.loaded && !translationService.configured && !documentError && (
             <div className="reader-notice setup-notice">
               <span><Sparkles size={15} /> {messages.pdfReady}</span>
-              <button className="secondary-button" onClick={() => setSettingsOpen(true)}>{messages.openSettings}</button>
+              <button className="secondary-button" onClick={() => openSettings()}>{messages.openSettings}</button>
             </div>
           )}
 
@@ -3535,7 +2864,7 @@ export default function Home() {
               <p>{messages.rendererFailedHelp}</p>
             </div>
           ) : (
-            <ReaderViewport zoom={readerZoom} onZoom={setReaderZoom} currentPage={currentPage}
+            <ReaderViewport currentPage={currentPage}
               fontSize={settings.translationFontSize} fontFamily={settings.translationFontFamily}
               dividerLabel={messages.readerDivider} dividerValueText={messages.readerDividerValue}>
               {pageNumbers.map((page) => (
@@ -3554,6 +2883,7 @@ export default function Home() {
                     && translationAnimationVersions[page] === displayedTranslations[page]?.cacheVersion}
                   translationAnimationSpeed={settings.translationAnimationSpeed}
                   loading={loadingPages.has(page)}
+                  progress={translationProgress[page]}
                   error={errors[page]}
                   pageImageUrl={serverBookAvailable
                     ? `/api/books/${encodeURIComponent(documentId)}/pages/${page}?profile=display`
@@ -3570,23 +2900,10 @@ export default function Home() {
             </ReaderViewport>
           )}
         </section>
+        </ReaderZoomProvider>
       </div>
 
       <div className="floating-status"><Sparkles size={15} /><span>{messages.contextWindow}</span><strong>{messages.pageRange(Math.max(1, currentPage - 1), Math.min(totalPages, currentPage + 1))}</strong></div>
-      {settingsOpen && (
-        <SettingsPanel
-          settings={settings}
-          translationService={translationService}
-          currentBookName={fileName}
-          canDiscardTranslations={!isDemo}
-          locale={locale}
-          messages={messages}
-          onChange={updateSettings}
-          onProviderSave={saveTranslationService}
-          onDiscardTranslations={discardCurrentBookTranslations}
-          onClose={() => setSettingsOpen(false)}
-        />
-      )}
     </main>
   );
 }

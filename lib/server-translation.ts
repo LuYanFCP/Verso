@@ -1,8 +1,13 @@
+import { ProviderTimeoutError, withProviderResponse } from "./server-provider-timeout";
+import { readProviderStream } from "./server-provider-stream";
+import { createTranslationStatistics, type TranslationProgress } from "./translation-progress";
+import { traceStep, traceAttributes, startSpan } from "./server-translation-trace";
 import { getAiProviderSettings } from "../db/ai-provider-settings";
 import { findBook, getStorage } from "../db/books";
-import type { AiProviderSettings } from "./ai-provider-settings";
+import { aiProviderEndpoint, type AiProviderSettings } from "./ai-provider-settings";
 import { hasLayoutContent, normalizeLayoutBlocks } from "./translation-layout";
 import { alignSourceBlocks } from "./source-alignment";
+import type { SourcePageLayout } from "./source-alignment";
 import { getSourcePageLayout } from "./server-source-layout";
 import { getRenderedPage } from "./server-page-renderer";
 
@@ -191,16 +196,10 @@ async function resolveTranslationImages(body: TranslationRequest): Promise<Trans
   if (book.pageCount !== body.totalPages) throw new Error("Book page count does not match the translation request.");
 
   return Promise.all(body.contextPages!.map(async (page) => {
-    const rendered = await getRenderedPage(book, page, "vision");
+    const rendered = await traceStep("images.page", () => getRenderedPage(book, page, "vision"), { page });
+    traceAttributes({ [`image${page}CacheHit`]: rendered.cacheHit });
     return { page, dataUrl: `data:image/jpeg;base64,${rendered.bytes.toString("base64")}` };
   }));
-}
-
-function endpointFor(config: AiProviderSettings) {
-  const raw = config.endpoint.trim().replace(/\/$/, "");
-  if (config.provider === "openai") return raw || "https://api.openai.com/v1/responses";
-  if (/\/(chat\/completions|responses)$/.test(raw)) return raw;
-  return `${raw}/chat/completions`;
 }
 
 export class TranslationProviderError extends Error {
@@ -211,19 +210,25 @@ export class TranslationProviderError extends Error {
   }
 }
 
-export async function generateTranslation(body: TranslationRequest) {
-    const config = await getAiProviderSettings();
+export async function generateTranslation(body: TranslationRequest, onProgress?: (progress: TranslationProgress) => void, signal?: AbortSignal) {
+  signal?.throwIfAborted();
+    const statistics = createTranslationStatistics();
+    onProgress?.({ phase: "preparing" });
+    const config = await traceStep("settings.load", () => getAiProviderSettings());
     if (!isConfigured(config)) {
       throw new TranslationProviderError("AI provider is not configured on the server.", 503);
     }
-    const endpoint = endpointFor(config);
+    const endpoint = aiProviderEndpoint(config);
     const headers = { Authorization: `Bearer ${config.apiKey}`, "Content-Type": "application/json" };
-    const images = await resolveTranslationImages(body);
+    traceAttributes({ model: config.model, reasoningEffort: config.reasoningEffort, protocol: config.provider });
+    const images = await traceStep("images.prepare", () => resolveTranslationImages(body));
+    const encode = startSpan("request.encode");
     const instruction = prompt(body, images);
     const isResponses = config.provider === "openai" || endpoint.endsWith("/responses");
     const payload = isResponses
       ? {
           model: config.model,
+          stream: true,
           ...(config.reasoningEffort !== "none" && { reasoning: { effort: config.reasoningEffort } }),
           input: [{
             role: "user",
@@ -239,6 +244,7 @@ export async function generateTranslation(body: TranslationRequest) {
         }
       : {
           model: config.model,
+          stream: true,
           ...(config.reasoningEffort !== "none" && { reasoning_effort: config.reasoningEffort }),
           messages: [{
             role: "user",
@@ -251,20 +257,86 @@ export async function generateTranslation(body: TranslationRequest) {
             ],
           }],
           response_format: { type: "json_object" },
+          stream_options: { include_usage: true },
         };
 
-    const response = await fetch(endpoint, {
+    const encoded = JSON.stringify(payload);
+    encode("ok", { requestBytes: Buffer.byteLength(encoded), images: images.length });
+    // Extract only this page while the provider works; preserve the same OCR and alignment.
+    // Attach the rejection handler immediately because the provider may finish much later.
+    const sourceLayout: Promise<SourcePageLayout | null> = body.bookId
+      ? traceStep("source.prepare", async () => {
+          const book = await findBook(getStorage().db, body.bookId!);
+          return book ? getSourcePageLayout(book, body.page) : null;
+        }).catch(() => { traceAttributes({ alignmentFallback: true }); return null; })
+      : Promise.resolve(null);
+    onProgress?.({ phase: "waiting" });
+    const providerStarted = performance.now();
+    const result = await withProviderResponse((signal) => traceStep("provider.wait_headers", () => fetch(endpoint, {
       method: "POST",
       headers,
-      body: JSON.stringify(payload),
-      signal: AbortSignal.timeout(180_000),
+      body: encoded,
+      signal,
+      redirect: "manual",
+    })), async (response) => {
+      traceAttributes({ httpStatus: response.status });
+      if (response.status >= 300 && response.status < 400) {
+        await response.body?.cancel();
+        throw new TranslationProviderError(`AI endpoint redirected (HTTP ${response.status}). Configure the final API URL in Settings and test the connection.`, 502);
+      }
+      const streaming = response.ok && Boolean(response.headers.get("content-type")?.includes("text/event-stream"));
+      traceAttributes({ streamed: streaming });
+      const result = streaming ? await traceStep("provider.stream", async () => {
+        const firstEvent = startSpan("provider.first_event", {}, providerStarted);
+        const firstText = startSpan("provider.first_text", {}, providerStarted);
+        const firstOutput = startSpan("provider.first_output", {}, providerStarted);
+        let hasText = false, hasReasoning = false;
+        return readProviderStream(response, isResponses, {
+          event: () => firstEvent(),
+          text: (delta) => {
+            firstText(); firstOutput(); hasText = true;
+            statistics.receive(delta);
+            onProgress?.({ phase: "generating", ...statistics.snapshot() });
+          },
+          reasoning: (delta) => {
+            firstOutput();
+            if (!hasReasoning) { startSpan("provider.first_reasoning", {}, providerStarted)(); hasReasoning = true; }
+            statistics.receive(delta);
+            if (!hasText) onProgress?.({ phase: "thinking", ...statistics.snapshot() });
+          },
+          usage: (usage) => {
+            traceAttributes({ outputUsageConsistent: statistics.reportUsage(usage) });
+            onProgress?.({ phase: hasText ? "generating" : "thinking", ...statistics.snapshot() });
+          },
+        });
+      }) : await traceStep("provider.read_body", async () => {
+        try { return await response.json() as Record<string, unknown>; }
+        catch { throw new TranslationProviderError(`Provider returned an invalid JSON response (HTTP ${response.status}).`, response.ok ? 502 : response.status); }
+      });
+      const usage = result.usage as Record<string, unknown> | undefined;
+      if (usage) {
+        const details = (usage.output_tokens_details || usage.completion_tokens_details) as Record<string, unknown> | undefined;
+        const inputDetails = usage.input_tokens_details as Record<string, unknown> | undefined;
+        for (const [key, value] of Object.entries({ inputTokens: usage.input_tokens ?? usage.prompt_tokens, outputTokens: usage.output_tokens ?? usage.completion_tokens,
+          reasoningTokens: details?.reasoning_tokens, cachedInputTokens: inputDetails?.cached_tokens ?? usage.prompt_cache_hit_tokens })) {
+          if (typeof value === "number" && Number.isFinite(value)) traceAttributes({ [key]: value });
+        }
+      }
+      if (!response.ok) {
+        const providerError = (result.error as { message?: string } | undefined)?.message;
+        throw new TranslationProviderError(providerError || `Provider returned ${response.status}.`, response.status);
+      }
+      return result;
+    }, undefined, signal).catch((error) => {
+      if (error instanceof ProviderTimeoutError) {
+        traceAttributes({ timeoutPhase: error.phase });
+        throw new TranslationProviderError(error.message, 504);
+      }
+      throw error;
     });
-    const result = await response.json() as Record<string, unknown>;
-    if (!response.ok) {
-      const providerError = (result.error as { message?: string } | undefined)?.message;
-      throw new TranslationProviderError(providerError || `Provider returned ${response.status}.`, response.status);
-    }
 
+    onProgress?.({ phase: "aligning", ...statistics.snapshot() });
+    const normalize = startSpan("response.normalize");
     let text: string | undefined;
     if (isResponses) {
       text = result.output_text as string | undefined;
@@ -278,17 +350,22 @@ export async function generateTranslation(body: TranslationRequest) {
     }
     if (!text) throw new Error("The model returned no translation text.");
     const translation = normalizeTranslationResponse(JSON.parse(text), body.page);
+    normalize();
     if (body.bookId) {
       const book = await findBook(getStorage().db, body.bookId);
       if (book) {
         try {
-          translation.blocks = alignSourceBlocks(translation.blocks, await getSourcePageLayout(book, body.page));
+          translation.blocks = await traceStep("alignment.current", async () => {
+            const layout = await sourceLayout;
+            return layout ? alignSourceBlocks(translation.blocks, layout) : translation.blocks;
+          });
           if (translation.previousPageRevision?.page === body.page - 1 && body.page > 1) {
-            translation.previousPageRevision.blocks = alignSourceBlocks(
-              translation.previousPageRevision.blocks, await getSourcePageLayout(book, body.page - 1),
-            );
+            const revision = translation.previousPageRevision;
+            revision.blocks = await traceStep("alignment.previous", async () => alignSourceBlocks(
+              revision.blocks, await getSourcePageLayout(book, body.page - 1),
+            ));
           }
-        } catch { /* Keep the translation readable if local extraction is temporarily unavailable. */ }
+        } catch { traceAttributes({ alignmentFallback: true }); }
       }
     }
     return translation;

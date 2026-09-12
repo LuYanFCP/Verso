@@ -3,9 +3,12 @@ import { spawn } from "node:child_process";
 import { access, chmod, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
 import { createServer } from "node:net";
 import { createServer as createHttpServer } from "node:http";
+import { DatabaseSync } from "node:sqlite";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import test, { after, before } from "node:test";
+import { runInNewContext } from "node:vm";
+import { applyTheme, watchTheme } from "../lib/theme.ts";
 import { createLocalPdfRangeTransport } from "../lib/local-pdf-range-transport.ts";
 import { createConcurrencyLimiter } from "../lib/concurrency-limiter.ts";
 import { isDocumentSearchShortcut } from "../lib/keyboard-shortcuts.ts";
@@ -48,6 +51,13 @@ test("restores font preferences safely from old or invalid reader settings", () 
 
 before(async () => {
   testDataDirectory = await mkdtemp(path.join(tmpdir(), "verso-test-"));
+  // Exercise the upgrade path from the original queue schema on every server test run.
+  const legacy = new DatabaseSync(path.join(testDataDirectory, "verso.sqlite"));
+  legacy.exec(`CREATE TABLE translation_queue (
+    document_id TEXT NOT NULL, target_language TEXT NOT NULL, next_page INTEGER NOT NULL DEFAULT 1,
+    concurrency INTEGER NOT NULL DEFAULT 4, status TEXT NOT NULL DEFAULT 'queued', error TEXT,
+    updated_at INTEGER NOT NULL, PRIMARY KEY (document_id, target_language))`);
+  legacy.close();
   const rendererPath = path.join(testDataDirectory, "pdftocairo");
   rendererLogPath = path.join(testDataDirectory, "renderer.log");
   await writeFile(rendererPath, `#!/usr/bin/env node
@@ -61,6 +71,16 @@ if (process.env.VERSO_PDF_RENDERER_LOG) {
 }
 `);
   await chmod(rendererPath, 0o700);
+  // Deterministic local extraction makes provider/OCR overlap observable without system tools.
+  for (const [tool, source] of Object.entries({
+    pdftotext: `console.log('<page width="100" height="100"></page>')`,
+    pdfinfo: 'console.log("Page rot: 0")',
+    tesseract: `setTimeout(() => console.log(${JSON.stringify("level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n1\t1\t0\t0\t0\t0\t0\t0\t100\t100\t-1\t\n5\t1\t1\t1\t1\t1\t10\t10\t40\t10\t99\tPage")}), 100)`,
+  })) {
+    const executable = path.join(testDataDirectory, tool);
+    await writeFile(executable, `#!/usr/bin/env node\n${source}\n`);
+    await chmod(executable, 0o700);
+  }
   const port = await new Promise((resolve, reject) => {
     const probe = createServer();
     probe.once("error", reject);
@@ -97,8 +117,19 @@ if (process.env.VERSO_PDF_RENDERER_LOG) {
 });
 
 after(async () => {
-  serverProcess?.kill("SIGTERM");
-  await rm(testDataDirectory, { recursive: true, force: true });
+  if (serverProcess && serverProcess.exitCode === null && serverProcess.signalCode === null) {
+    // Sending a signal is asynchronous; the server can still write render caches
+    // until it exits. Wait for its stdio to close before removing the library.
+    const closed = new Promise(resolve => serverProcess.once("close", resolve));
+    const timeout = setTimeout(() => serverProcess.kill("SIGKILL"), 5000);
+    try {
+      serverProcess.kill("SIGTERM");
+      await closed;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  if (testDataDirectory) await rm(testDataDirectory, { recursive: true, force: true });
 });
 
 async function render(path = "/", headers = {}) {
@@ -164,14 +195,16 @@ test("server-renders the Verso library home", async () => {
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
 
   const html = await response.text();
-  assert.match(html, /<title>Verso — AI Parallel Reader<\/title>/i);
+  assert.match(html, /<title>Verso — Read beyond language<\/title>/i);
   assert.match(html, /<html lang="en-US">/i);
   assert.match(html, /Verso/);
-  assert.match(html, /AI Reader/);
+  assert.match(html, /Read beyond language/);
   assert.match(html, /Your library/);
   assert.match(html, /Upload a new PDF/);
-  assert.match(html, /Local Library/);
-  assert.match(html, /Toggle light or dark mode/);
+  assert.match(html, />Library</);
+  assert.doesNotMatch(html, /Local Library|AI Reader/);
+  assert.match(html, /aria-label="Appearance"/);
+  assert.match(html, /<option value="system" selected="">System<\/option>/);
   assert.doesNotMatch(html, /codex-preview|Your site is taking shape|react-loading-skeleton/i);
 });
 
@@ -190,10 +223,93 @@ test("server-renders the preferred interface locale without a hydration switch",
   assert.match(savedEnglishHtml, /Upload a new PDF/);
 });
 
+test("initializes the theme before rendering, respecting saved preferences and blocked storage", async () => {
+  const html = await (await render()).text();
+  const script = [...html.matchAll(/<script[^>]*>([\s\S]*?)<\/script>/g)]
+    .find((match) => match[1].includes("verso-theme"))?.[1];
+  assert.ok(script);
+  assert.ok(html.indexOf(script) < html.indexOf("<body"));
+  for (const saved of [null, "system", "light", "dark", "invalid"]) {
+    for (const prefersDark of [false, true]) {
+      for (const blocked of [false, true]) {
+        const root = { dataset: {} };
+        runInNewContext(script, {
+          document: { documentElement: root },
+          window: { matchMedia: () => ({ matches: prefersDark }) },
+          localStorage: { getItem: () => { if (blocked) throw new Error("Storage blocked"); return saved; } },
+        });
+        const expected = !blocked && ["light", "dark"].includes(saved) ? saved : prefersDark ? "dark" : "light";
+        assert.equal(root.dataset.theme, expected, `${saved}, dark=${prefersDark}, blocked=${blocked}`);
+      }
+    }
+  }
+});
+
+test("follows live system theme changes and stops following when an explicit theme is chosen", () => {
+  const root = { dataset: {} };
+  const media = new EventTarget();
+  media.matches = false;
+  const context = {
+    document: { documentElement: root },
+    window: { matchMedia: () => media },
+  };
+  const watch = (theme) => runInNewContext(`${applyTheme.toString()}; (${watchTheme.toString()})(${JSON.stringify(theme)})`, context);
+  const stop = watch("system");
+  assert.equal(root.dataset.theme, "light");
+  media.matches = true;
+  media.dispatchEvent(new Event("change"));
+  assert.equal(root.dataset.theme, "dark");
+  media.matches = false;
+  media.dispatchEvent(new Event("change"));
+  assert.equal(root.dataset.theme, "light");
+  stop();
+  media.matches = true;
+  media.dispatchEvent(new Event("change"));
+  assert.equal(root.dataset.theme, "light");
+  for (const theme of ["dark", "light"]) {
+    assert.equal(watch(theme), undefined);
+    media.matches = theme !== "dark";
+    media.dispatchEvent(new Event("change"));
+    assert.equal(root.dataset.theme, theme);
+  }
+  const stopAgain = watch("system");
+  assert.equal(root.dataset.theme, "dark");
+  stopAgain();
+});
+
 test("resolves an explicit locale before the best supported browser language", () => {
   assert.equal(resolveUiLocale("en-US", "zh-CN,zh;q=0.9"), "en-US");
   assert.equal(resolveUiLocale(undefined, "fr-FR,zh-CN;q=0.8,en-US;q=0.6"), "zh-CN");
   assert.equal(resolveUiLocale(undefined, "fr-FR"), "en-US");
+});
+
+test("serves settings as a localized page with a library navigation link", async () => {
+  const home = await (await render()).text();
+  assert.match(home, /href="\/settings"/);
+  for (const [locale, title] of [["en-US", "Settings"], ["zh-CN", "设置"]]) {
+    const response = await render("/settings", { cookie: `${UI_LOCALE_COOKIE}=${locale}` });
+    assert.equal(response.status, 200);
+    const html = await response.text();
+    assert.match(html, new RegExp(`<h1>${title}</h1>`));
+    assert.match(html, new RegExp(`<option value="system" selected="">${locale === "zh-CN" ? "跟随系统" : "System"}</option>`));
+    for (const section of ["ai-provider", "translation", "reading", "interface"]) {
+      assert.match(html, new RegExp(`id="${section}"`));
+    }
+    assert.doesNotMatch(html, /role="dialog"|aria-modal="true"/);
+  }
+});
+
+test("settings returns to a book and page while rejecting external return destinations", async () => {
+  const html = await (await render(`/settings?returnTo=${encodeURIComponent("/?book=sample&page=7")}`)).text();
+  assert.match(html, /href="\/\?book=sample&amp;page=7"/);
+  assert.match(html, /Back to reading/);
+  for (const destination of ["https://example.com/?book=sample", "//example.com/?book=sample", "http://[", "/settings"]) {
+    const response = await render(`/settings?returnTo=${encodeURIComponent(destination)}`);
+    assert.equal(response.status, 200);
+    const fallback = await response.text();
+    assert.match(fallback, /Back to library/);
+    assert.doesNotMatch(fallback, /href="https?:\/\/example.com/);
+  }
 });
 
 test("rejects incomplete translation requests", async () => {
@@ -235,6 +351,20 @@ test("does not use provider credentials from environment variables for translati
   });
   assert.equal(response.status, 503);
   assert.deepEqual(await response.json(), { error: "AI provider is not configured on the server." });
+  const id = response.headers.get("x-verso-trace-id");
+  assert.ok(id);
+  const traceResponse = await fetch(`${baseUrl}/api/traces?id=${id}`);
+  assert.match(traceResponse.headers.get("cache-control"), /no-store/);
+  const { traces } = await traceResponse.json();
+  assert.equal(traces.length, 1);
+  assert.equal(traces[0].status, "error");
+  assert.ok(traces[0].spans.every(span => span.status !== "running"));
+});
+
+test("connection testing requires stored credentials", async () => {
+  const response = await fetch(`${baseUrl}/api/settings/ai-provider/test`, { method: "POST" });
+  assert.equal(response.status, 400);
+  assert.deepEqual(await response.json(), { error: "not_configured" });
 });
 
 test("stores AI provider settings in SQLite without returning the API key", async () => {
@@ -281,6 +411,69 @@ test("stores AI provider settings in SQLite without returning the API key", asyn
 
   const database = await stat(path.join(testDataDirectory, "verso.sqlite"));
   assert.equal(database.mode & 0o777, 0o600);
+});
+
+test("connection testing checks the saved model through both provider protocols without exposing credentials", async () => {
+  const requests = [];
+  let mode = "success";
+  const secret = "connection-test-private-key";
+  const provider = createHttpServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    requests.push({ url: request.url, authorization: request.headers.authorization, body: JSON.parse(Buffer.concat(chunks).toString()) });
+    response.setHeader("content-type", "application/json");
+    if (mode === "unauthorized") {
+      response.statusCode = 401;
+      response.end(JSON.stringify({ error: { message: secret } }));
+    } else if (mode === "invalid") {
+      response.end(JSON.stringify({ status: "healthy" }));
+    } else {
+      response.end(JSON.stringify(request.url.endsWith("/responses")
+        ? { output: [{ content: [{ type: "output_text", text: "OK" }] }] }
+        : { choices: [{ message: { content: "OK" } }] }));
+    }
+  });
+  await new Promise((resolve) => provider.listen(0, "127.0.0.1", resolve));
+  try {
+    for (const [kind, suffix, expectedPath] of [["compatible", "/v1", "/v1/chat/completions"], ["openai", "/v1", "/v1/responses"], ["openai", "/v1/responses", "/v1/responses"], ["compatible", "/v1/responses", "/v1/responses"]]) {
+      const settings = { provider: kind, endpoint: `http://127.0.0.1:${provider.address().port}${suffix}`, apiKey: secret, model: "connection-model", reasoningEffort: "high" };
+      assert.equal((await fetch(`${baseUrl}/api/settings/ai-provider`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(settings) })).status, 200);
+      const before = await (await fetch(`${baseUrl}/api/settings/ai-provider`)).json();
+      const response = await fetch(`${baseUrl}/api/settings/ai-provider/test`, { method: "POST" });
+      assert.equal(response.status, 200);
+      assert.match(response.headers.get("cache-control"), /no-store/);
+      const text = await response.text();
+      assert.ok(!text.includes(secret));
+      const result = JSON.parse(text);
+      assert.equal(result.ok, true);
+      assert.ok(result.latencyMs >= 0);
+      assert.deepEqual(await (await fetch(`${baseUrl}/api/settings/ai-provider`)).json(), before);
+      const request = requests.at(-1);
+      assert.equal(request.url, expectedPath);
+      assert.equal(request.authorization, `Bearer ${secret}`);
+      assert.equal(request.body.model, "connection-model");
+      if (expectedPath.endsWith("/responses")) {
+        assert.equal(request.body.reasoning.effort, "high");
+        assert.equal(request.body.input[0].content[0].text, "Reply with exactly OK.");
+      } else {
+        assert.equal(request.body.reasoning_effort, "high");
+        assert.equal(request.body.messages[0].content, "Reply with exactly OK.");
+      }
+    }
+    mode = "unauthorized";
+    const failure = await fetch(`${baseUrl}/api/settings/ai-provider/test`, { method: "POST" });
+    assert.equal(failure.status, 502);
+    assert.deepEqual(await failure.json(), { error: "provider_error", status: 401 });
+    mode = "invalid";
+    const invalid = await fetch(`${baseUrl}/api/settings/ai-provider/test`, { method: "POST" });
+    assert.equal(invalid.status, 502);
+    assert.deepEqual(await invalid.json(), { error: "invalid_response" });
+  } finally {
+    await new Promise((resolve, reject) => provider.close(error => error ? reject(error) : resolve()));
+  }
+  const unreachable = await fetch(`${baseUrl}/api/settings/ai-provider/test`, { method: "POST" });
+  assert.equal(unreachable.status, 502);
+  assert.deepEqual(await unreachable.json(), { error: "connection_failed" });
 });
 
 test("rejects incomplete search requests", async () => {
@@ -434,10 +627,22 @@ test("searches translated blocks without matching source text", () => {
 });
 
 test("recognizes browser find shortcuts without hijacking modified keys", () => {
-  assert.equal(isDocumentSearchShortcut({ key: "f", ctrlKey: true, metaKey: false, altKey: false }), true);
-  assert.equal(isDocumentSearchShortcut({ key: "F", ctrlKey: false, metaKey: true, altKey: false }), true);
-  assert.equal(isDocumentSearchShortcut({ key: "f", ctrlKey: true, metaKey: false, altKey: true }), false);
-  assert.equal(isDocumentSearchShortcut({ key: "g", ctrlKey: true, metaKey: false, altKey: false }), false);
+  const plainKey = { key: "f", ctrlKey: false, metaKey: false, altKey: false, shiftKey: false };
+  assert.equal(isDocumentSearchShortcut({ ...plainKey, ctrlKey: true }), true);
+  assert.equal(isDocumentSearchShortcut({ ...plainKey, key: "F", metaKey: true }), true);
+  assert.equal(isDocumentSearchShortcut(plainKey), false);
+  assert.equal(isDocumentSearchShortcut({ ...plainKey, key: "g", ctrlKey: true }), false);
+
+  for (const modifier of ["ctrlKey", "metaKey"]) {
+    assert.equal(isDocumentSearchShortcut({ ...plainKey, [modifier]: true, altKey: true }), false);
+    assert.equal(isDocumentSearchShortcut({ ...plainKey, [modifier]: true, shiftKey: true }), false);
+  }
+});
+
+test("leaves the macOS fullscreen shortcut to the system", () => {
+  assert.equal(isDocumentSearchShortcut({
+    key: "f", ctrlKey: true, metaKey: true, altKey: false, shiftKey: false,
+  }), false);
 });
 
 test("reveals translations at a stable characters-per-second rate", () => {
@@ -919,6 +1124,15 @@ test("requests and persists image crops, typography, and sentence positions with
       assert.equal(response.status, 200);
       const translation = await response.json();
       assert.equal(translation.isBlank, false);
+      assert.equal(response.headers.get("x-verso-trace-id"), translation.trace.id);
+      assert.match(response.headers.get("server-timing"), /provider.wait_headers/);
+      assert.equal(translation.trace.status, "ok");
+      assert.equal(translation.trace.attributes.model, "vision-test");
+      assert.doesNotMatch(JSON.stringify(translation.trace), /test-key|data:image|Source sentence|译文/);
+      const traceExport = await (await fetch(`${baseUrl}/api/traces?id=${translation.trace.id}&format=chrome`)).json();
+      const lanes = traceExport.traceEvents.filter(event => event.ph === "X").map(event => `${event.pid}:${event.tid}`);
+      assert.equal(new Set(lanes).size, lanes.length);
+      assert.ok(traceExport.traceEvents.some(event => event.ph === "X" && event.name === "provider.wait_headers" && event.dur >= 0));
       assert.deepEqual(translation.blocks[0].sentences, textBlock.sentences);
       assert.equal(translation.blocks[0].fontSize, 0.025);
       assert.deepEqual(translation.blocks[1].sourceRect, imageBlock.sourceRect);
@@ -993,7 +1207,7 @@ test("repairs a cached cross-page word without repeating it or losing page-local
   await new Promise((resolve) => provider.listen(0, "127.0.0.1", resolve));
   try {
     for (const [index, format] of ["openai", "compatible"].entries()) {
-      const book = await uploadQueueBook(String(index + 7).repeat(64), 2);
+      const book = await uploadQueueBook(`c${index + 1}`.repeat(32), 2);
       const settings = await fetch(`${baseUrl}/api/settings/ai-provider`, {
         method: "PUT", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ provider: format, endpoint: `http://127.0.0.1:${provider.address().port}/${format === "openai" ? "responses" : "v1"}`, apiKey: "test-key", model: "boundary-test", reasoningEffort: "none" }),
@@ -1462,6 +1676,60 @@ test("preserves uncaptained artwork and rejects incompatible caption bounds", as
   assert.equal(excludeImageCaption(page, estimate, { x: 20, y: 40, width: 70, height: 80 }).crop, estimate);
 });
 
+test("upgrades a sequential retry without losing its page or double-advancing the cursor", async () => {
+  const directory = await mkdtemp(path.join(tmpdir(), "verso-queue-upgrade-"));
+  try {
+    const legacy = new DatabaseSync(path.join(directory, "verso.sqlite"));
+    legacy.exec(`CREATE TABLE books (id TEXT PRIMARY KEY, fingerprint TEXT UNIQUE, name TEXT, object_key TEXT,
+      size INTEGER, page_count INTEGER, content_type TEXT, uploaded_at INTEGER);
+      INSERT INTO books VALUES ('legacy', 'legacy', 'Legacy.pdf', 'books/legacy.pdf', 10, 5, 'application/pdf', 1);
+      CREATE TABLE translation_queue (document_id TEXT NOT NULL, target_language TEXT NOT NULL,
+        next_page INTEGER DEFAULT 1, concurrency INTEGER DEFAULT 4, status TEXT DEFAULT 'queued', error TEXT,
+        updated_at INTEGER, retry_count INTEGER DEFAULT 0, retry_at INTEGER DEFAULT 0, run_id INTEGER DEFAULT 0,
+        PRIMARY KEY (document_id, target_language));
+      INSERT INTO translation_queue VALUES ('legacy', 'English', 2, 1, 'retrying', 'Temporary error', 1, 2, 123, 7);`);
+    legacy.close();
+    const source = `import assert from 'node:assert/strict';
+      const { ensureStorageSchema, getStorage } = await import('./db/books.ts');
+      await ensureStorageSchema(); const { db } = getStorage();
+      const page = await db.prepare('SELECT * FROM translation_queue_pages').first();
+      assert.equal(page.page, 2); assert.equal(page.retry_count, 2); assert.equal(page.retry_at, 123);
+      assert.equal(page.error, 'Temporary error');
+      const job = await db.prepare('SELECT * FROM translation_queue').first();
+      assert.equal(job.next_page, 3); assert.equal(job.run_id, 7); assert.equal(job.retry_count, 2);
+      assert.equal((await db.prepare('SELECT concurrency FROM translation_queue_settings').first()).concurrency, 4);`;
+    for (let restart = 0; restart < 2; restart++) await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ["--input-type=module", "--eval", source], {
+        cwd: process.cwd(), env: { ...process.env, VERSO_DATA_DIR: directory }, stdio: ["ignore", "pipe", "pipe"],
+      });
+      let output = "";
+      child.stderr.on("data", chunk => { output += chunk; });
+      child.once("error", reject);
+      child.once("exit", code => code === 0 ? resolve() : reject(new Error(output)));
+    });
+  } finally { await rm(directory, { recursive: true, force: true }); }
+});
+
+test("reader and provider limiters allow ten requests and hold the eleventh", async () => {
+  const { createPriorityTaskQueue } = await import("../lib/priority-task-queue.ts");
+  for (const priority of [false, true]) {
+    const queue = priority ? createPriorityTaskQueue() : createConcurrencyLimiter();
+    const started = [];
+    const releases = [];
+    const tasks = Array.from({ length: 11 }, (_, index) => {
+      const run = () => new Promise(resolve => { started.push(index); releases[index] = resolve; });
+      return priority ? queue.run(String(index), 1, 10, run) : queue.run(10, run);
+    });
+    await new Promise(setImmediate);
+    assert.equal(started.length, 10);
+    releases[0]();
+    await new Promise(setImmediate);
+    assert.equal(started.length, 11);
+    for (const release of releases) release();
+    await Promise.all(tasks);
+  }
+});
+
 test("prioritizes reader jobs, promotes pending pages, and shares running translations", async () => {
   const { createPriorityTaskQueue } = await import("../lib/priority-task-queue.ts");
   const queue = createPriorityTaskQueue();
@@ -1515,6 +1783,15 @@ async function queueStatus(documentId, language = "English") {
   return (await response.json()).jobs.find((job) => job.documentId === documentId);
 }
 
+async function configureQueue(concurrency) {
+  const response = await fetch(`${baseUrl}/api/translation-queue`, {
+    method: "PATCH", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ action: "configure", concurrency }),
+  });
+  assert.equal(response.status, 200);
+  assert.equal((await response.json()).settings.concurrency, concurrency);
+}
+
 async function enqueueTestBook(book, language = "English") {
   const response = await fetch(`${baseUrl}/api/translation-queue`, {
     method: "POST", headers: { "Content-Type": "application/json" },
@@ -1532,10 +1809,13 @@ async function readTestPage(book, page, extra = {}) {
 }
 
 test("persists whole-book work, shares reader requests, skips cached blank pages, and retries failures", async () => {
+  assert.equal((await (await fetch(`${baseUrl}/api/translation-queue`)).json()).settings.concurrency, 4);
+  await configureQueue(1);
   const book = await uploadQueueBook("b".repeat(64), 4);
   const calls = [];
   const responses = new Map();
   let failPage = 0;
+  const transientFailures = new Map();
   let hold = true;
   const provider = createHttpServer(async (request, response) => {
     const chunks = [];
@@ -1546,6 +1826,11 @@ test("persists whole-book work, shares reader requests, skips cached blank pages
     const finish = () => {
       if (response.writableEnded || response.destroyed) return;
       response.setHeader("Content-Type", "application/json");
+      if (transientFailures.get(page) > 0) {
+        transientFailures.set(page, transientFailures.get(page) - 1);
+        response.end(JSON.stringify({ choices: [{ message: { content: '{"blocks": [invalid json' } }] }));
+        return;
+      }
       if (page === failPage) { response.writeHead(429); response.end(JSON.stringify({ error: { message: "Rate limit" } })); return; }
       response.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ page, blocks: [{ kind: "paragraph", text: `Page ${page}.` }], previousPageRevision: null }) } }] }));
     };
@@ -1569,6 +1854,24 @@ test("persists whole-book work, shares reader requests, skips cached blank pages
     assert.equal(blank.status, 200);
     await Promise.all([enqueueTestBook(book), enqueueTestBook(book)]);
     await waitFor(() => responses.has(2));
+    const live = await (await fetch(`${baseUrl}/api/traces`)).json();
+    assert.ok(live.traces.some(trace => trace.background && trace.page === 2 && trace.status === "running" && trace.spans.some(span => span.name === "provider.wait_headers" && span.status === "running")));
+    // A cached blank page must bypass a queue whose only provider slot is occupied.
+    const cachedWhileBusy = await fetch(`${baseUrl}/api/translate`, { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ bookId: book.fingerprint, targetLanguage: "English", page: 1, totalPages: book.pageCount, contextPages: [1], translationConcurrency: 1 }),
+      signal: AbortSignal.timeout(2000) });
+    assert.equal(cachedWhileBusy.status, 200);
+    const fast = await cachedWhileBusy.json();
+    assert.equal(fast.isBlank, true);
+    assert.equal(fast.trace.attributes.cacheHit, true);
+    assert.ok(!fast.trace.spans.some(span => span.name === "queue.wait"));
+    // OCR must finish while the provider is still deliberately held open.
+    await waitFor(async () => {
+      const { traces } = await (await fetch(`${baseUrl}/api/traces`)).json();
+      return traces.some(trace => trace.bookId === book.fingerprint && trace.page === 2 && trace.status === "running"
+        && trace.spans.some(span => span.name === "source.ocr" && span.status === "ok")
+        && trace.spans.some(span => span.name === "provider.wait_headers" && span.status === "running"));
+    });
     const samePage = readTestPage(book, 2);
     const reader = readTestPage(book, 4);
     await new Promise((resolve) => setTimeout(resolve, 100));
@@ -1594,20 +1897,112 @@ test("persists whole-book work, shares reader requests, skips cached blank pages
     assert.equal((await readTestPage(book, 2, { force: true })).status, 200);
     assert.deepEqual(calls, [2, 4, 3, 2]);
 
-    const retryBook = await uploadQueueBook("c".repeat(64), 2);
+    const retryBook = await uploadQueueBook("c".repeat(64), 4);
     calls.length = 0;
     failPage = 2;
     await enqueueTestBook(retryBook);
-    const failed = await waitFor(async () => { const job = await queueStatus(retryBook.fingerprint); return job?.status === "failed" && job; });
-    assert.equal(failed.completedPages, 1);
+    const failed = await waitFor(async () => { const job = await queueStatus(retryBook.fingerprint); return job?.status === "partial" && job; });
+    assert.equal(failed.completedPages, 3);
     assert.match(failed.error, /Rate limit/);
+    assert.equal(failed.retryCount, 3);
+    assert.equal(failed.maxRetriesPerPage, 3);
+    assert.equal(failed.failedPageLimit, 3);
+    assert.equal(failed.failedPages, 1);
+    assert.deepEqual(failed.pageErrors.map(page => [page.page, page.retryCount, page.status]), [[2, 3, "failed"]]);
+    assert.equal(failed.nextPage, 2);
+    assert.deepEqual(calls, [1, 2, 2, 2, 2, 3, 4]);
     failPage = 0;
+    // A page recovered by reading must no longer count as an exhausted failure.
+    assert.equal((await readTestPage(retryBook, 2)).status, 200);
+    const repaired = await queueStatus(retryBook.fingerprint);
+    assert.equal(repaired.failedPages, 0);
+    assert.equal(repaired.status, "completed");
+    assert.equal(repaired.retryCount, 0);
     await enqueueTestBook(retryBook);
     await waitFor(async () => (await queueStatus(retryBook.fingerprint))?.status === "completed");
-    assert.deepEqual(calls, [1, 2, 2]);
+    assert.deepEqual(calls, [1, 2, 2, 2, 2, 3, 4, 2]);
     await enqueueTestBook(retryBook, "Japanese");
     await waitFor(async () => (await queueStatus(retryBook.fingerprint, "Japanese"))?.status === "completed");
-    assert.deepEqual(calls, [1, 2, 2, 1, 2]);
+    assert.deepEqual(calls, [1, 2, 2, 2, 2, 3, 4, 2, 1, 2, 3, 4]);
+
+    // Recovered errors across pages must never count as exhausted pages.
+    const recoveredBook = await uploadQueueBook("f".repeat(64), 2);
+    calls.length = 0;
+    transientFailures.set(1, 2);
+    transientFailures.set(2, 2);
+    await enqueueTestBook(recoveredBook);
+    const retrying = await waitFor(async () => {
+      const job = await queueStatus(recoveredBook.fingerprint);
+      return job?.status === "retrying" && job;
+    });
+    assert.ok(retrying.error);
+    assert.equal(retrying.nextPage, 1);
+    const recovered = await waitFor(async () => {
+      const job = await queueStatus(recoveredBook.fingerprint);
+      return job?.status === "completed" && job;
+    });
+    assert.equal(recovered.retryCount, 0);
+    assert.equal(recovered.error, null);
+    assert.deepEqual(calls, [1, 1, 1, 2, 2, 2]);
+
+    // Stop an in-flight page, preserve earlier pages, and immediately resume the same job.
+    const stopBook = await uploadQueueBook("8".repeat(64), 3);
+    calls.length = 0;
+    hold = true;
+    responses.clear();
+    await enqueueTestBook(stopBook);
+    await waitFor(() => responses.has(1));
+    await enqueueTestBook(stopBook, "Japanese");
+    assert.equal((await fetch(`${baseUrl}/api/translation-queue`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ bookId: stopBook.id, targetLanguage: "Japanese", action: "stop" }),
+    })).status, 200);
+    assert.equal((await queueStatus(stopBook.fingerprint, "Japanese")).status, "stopped");
+    assert.equal((await queueStatus(stopBook.fingerprint)).status, "running");
+    responses.get(1)();
+    await waitFor(() => responses.has(2));
+    const lateResponse = responses.get(2);
+    const stop = await fetch(`${baseUrl}/api/translation-queue`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ bookId: stopBook.id, targetLanguage: "English", action: "stop" }),
+    });
+    assert.equal(stop.status, 200);
+    const stoppedJob = await queueStatus(stopBook.fingerprint);
+    assert.equal(stoppedJob.status, "stopped");
+    assert.equal(stoppedJob.completedPages, 1);
+    assert.equal(stoppedJob.retryCount, 0);
+    lateResponse();
+    await new Promise(resolve => setTimeout(resolve, 100));
+    assert.deepEqual(calls, [1, 2]);
+    assert.equal((await queueStatus(stopBook.fingerprint)).status, "stopped");
+    hold = false;
+    await enqueueTestBook(stopBook);
+    const resumed = await waitFor(async () => {
+      const job = await queueStatus(stopBook.fingerprint);
+      return job?.status === "completed" && job;
+    });
+    assert.equal(resumed.completedPages, 3);
+    assert.equal(resumed.error, null);
+    assert.deepEqual(calls, [1, 2, 2, 3]);
+
+    // Stop during backoff: no retry fires until the user resumes.
+    const backoffBook = await uploadQueueBook("ab".repeat(32), 1);
+    failPage = 1;
+    calls.length = 0;
+    await enqueueTestBook(backoffBook);
+    await waitFor(async () => (await queueStatus(backoffBook.fingerprint))?.status === "retrying");
+    assert.equal((await fetch(`${baseUrl}/api/translation-queue`, {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ bookId: backoffBook.id, targetLanguage: "English", action: "stop" }),
+    })).status, 200);
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    assert.deepEqual(calls, [1]);
+    assert.equal((await queueStatus(backoffBook.fingerprint)).status, "stopped");
+    failPage = 0;
+    const allJobs = await (await fetch(`${baseUrl}/api/translation-queue`)).json();
+    assert.ok(allJobs.jobs.some(job => job.documentId === retryBook.fingerprint && job.targetLanguage === "Japanese"));
+    assert.ok(allJobs.jobs.some(job => job.documentId === retryBook.fingerprint && job.targetLanguage === "English"));
+    assert.ok(allJobs.jobs.every(job => job.bookName && job.bookId && job.maxRetriesPerPage === 3 && job.failedPageLimit === 3));
 
     // Discarding must prevent a still-running provider response from restoring the cache.
     const discardBook = await uploadQueueBook("d".repeat(64), 2);
@@ -1646,10 +2041,372 @@ test("persists whole-book work, shares reader requests, skips cached blank pages
     });
     await waitFor(async () => (await queueStatus(restartBook.fingerprint))?.status === "completed");
     assert.deepEqual(calls, [1, 2, 2]);
+    const persistedStop = await queueStatus(backoffBook.fingerprint);
+    assert.equal(persistedStop.status, "stopped");
+    assert.equal(persistedStop.retryCount, 1);
+    assert.equal((await queueStatus(stopBook.fingerprint, "Japanese")).status, "stopped");
   } finally {
     hold = false;
     for (const finish of responses.values()) finish();
     provider.closeAllConnections();
     await new Promise((resolve) => provider.close(resolve));
+  }
+});
+
+test("runs ten background pages, applies independent limits live, and resumes out-of-order work", async () => {
+  const book = await uploadQueueBook("bc".repeat(32), 15);
+  const calls = [];
+  const pending = new Map();
+  const provider = createHttpServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    const input = JSON.parse(Buffer.concat(chunks).toString());
+    const page = Number(input.messages[0].content[0].text.match(/The requested page is (\d+)/)[1]);
+    calls.push(page);
+    pending.set(page, response);
+    response.on("close", () => { if (pending.get(page) === response) pending.delete(page); });
+  });
+  const finish = (page, fail = false) => {
+    const response = pending.get(page);
+    assert.ok(response, `Page ${page} must be in flight`);
+    pending.delete(page);
+    response.setHeader("Content-Type", "application/json");
+    response.end(JSON.stringify({ choices: [{ message: { content: fail ? "invalid JSON" : JSON.stringify({ page,
+      blocks: [{ kind: "paragraph", text: `Concurrent page ${page}.` }],
+      previousPageRevision: page === 3 && pending.has(2) ? { page: 2, blocks: [{ kind: "paragraph", text: `Concurrent page ${page}.` }] } : null }) } }] }));
+  };
+  const stop = async (value) => {
+    const response = await fetch(`${baseUrl}/api/translation-queue`, { method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ bookId: value.id, targetLanguage: "English", action: "stop" }) });
+    assert.equal(response.status, 200);
+  };
+  await new Promise(resolve => provider.listen(0, "127.0.0.1", resolve));
+  try {
+    assert.equal((await fetch(`${baseUrl}/api/settings/ai-provider`, { method: "PUT", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ provider: "compatible", endpoint: `http://127.0.0.1:${provider.address().port}/v1`, apiKey: "test-key", model: "test", reasoningEffort: "none" }) })).status, 200);
+    for (const invalid of [0, 11, 1.5, "10", null]) {
+      assert.equal((await fetch(`${baseUrl}/api/translation-queue`, { method: "PATCH", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "configure", concurrency: invalid }) })).status, 400);
+    }
+    await configureQueue(3);
+    // The legacy reader concurrency field must not overwrite the background setting.
+    await enqueueTestBook(book);
+    await waitFor(() => pending.size === 3);
+    assert.deepEqual([...pending.keys()].sort((a, b) => a - b), [1, 2, 3]);
+    assert.equal((await queueStatus(book.fingerprint)).activePages, 3);
+    finish(3);
+    await waitFor(() => pending.has(4));
+    const parallelPage = await (await readTestPage(book, 3)).json();
+    assert.ok(parallelPage.blocks.some(block => block.text === "Concurrent page 3."), "Do not remove text against an unapplied predecessor revision");
+    await configureQueue(1);
+    finish(4); finish(2);
+    await waitFor(async () => (await queueStatus(book.fingerprint)).completedPages === 3);
+    assert.deepEqual([...pending.keys()], [1]);
+    assert.equal(calls.length, 4);
+    finish(1);
+    await waitFor(() => pending.has(5));
+    await configureQueue(10);
+    await waitFor(() => pending.size === 10);
+    assert.deepEqual([...pending.keys()].sort((a, b) => a - b), Array.from({ length: 10 }, (_, index) => index + 5));
+    assert.equal((await queueStatus(book.fingerprint)).activePages, 10);
+    const interrupted = new Promise(resolve => serverProcess.once("exit", resolve));
+    serverProcess.kill("SIGKILL"); await interrupted;
+    await waitFor(() => pending.size === 0);
+    serverProcess = spawn(process.execPath, [".next/standalone/server.js"], { cwd: process.cwd(),
+      env: { ...process.env, HOSTNAME: "127.0.0.1", PORT: new URL(baseUrl).port, VERSO_DATA_DIR: testDataDirectory,
+        VERSO_PDF_RENDERER_LOG: rendererLogPath, PATH: `${testDataDirectory}:${process.env.PATH || ""}` }, stdio: ["ignore", "pipe", "pipe"] });
+    await waitFor(() => pending.size === 10);
+    assert.equal((await queueStatus(book.fingerprint)).completedPages, 4);
+    assert.deepEqual([...pending.keys()].sort((a, b) => a - b), Array.from({ length: 10 }, (_, index) => index + 5));
+    await stop(book);
+    await waitFor(() => pending.size === 0);
+    const stopped = await queueStatus(book.fingerprint);
+    assert.equal(stopped.completedPages, 4);
+    assert.equal(stopped.status, "stopped");
+    await enqueueTestBook(book);
+    await waitFor(() => pending.size === 10);
+    for (let page = 14; page >= 5; page--) finish(page);
+    await waitFor(() => pending.has(15));
+    finish(15);
+    await waitFor(async () => (await queueStatus(book.fingerprint)).status === "completed");
+    assert.equal((await queueStatus(book.fingerprint)).completedPages, 15);
+    assert.equal(calls.filter(page => page <= 4).length, 4);
+    assert.equal((await readTestPage(book, 1, { translationConcurrency: 10 })).status, 200);
+    assert.equal((await readTestPage(book, 1, { translationConcurrency: 11 })).status, 400);
+
+    await configureQueue(2);
+    const retryBook = await uploadQueueBook("bd".repeat(32), 4);
+    await enqueueTestBook(retryBook);
+    await waitFor(() => pending.has(1) && pending.has(2));
+    finish(1, true);
+    await waitFor(() => pending.has(1));
+    finish(2, true);
+    await waitFor(async () => (await queueStatus(retryBook.fingerprint)).retryCount === 2);
+    finish(1);
+    await waitFor(async () => (await queueStatus(retryBook.fingerprint)).retryCount === 1);
+    assert.equal((await queueStatus(retryBook.fingerprint)).completedPages, 1);
+    await waitFor(() => pending.has(2));
+    finish(2);
+    await waitFor(() => pending.has(3) && pending.has(4));
+    finish(3, true); finish(4);
+    await waitFor(() => pending.has(3));
+    finish(3, true);
+    await waitFor(() => pending.has(3));
+    finish(3);
+    await waitFor(async () => (await queueStatus(retryBook.fingerprint)).status === "completed");
+    assert.equal((await queueStatus(retryBook.fingerprint)).retryCount, 0);
+
+    const exhaustedBook = await uploadQueueBook("be".repeat(32), 5);
+    const exhaustedCallsStart = calls.length;
+    await enqueueTestBook(exhaustedBook);
+    // Each of these pages must get its own initial attempt plus all three retries.
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await waitFor(() => pending.has(1) && pending.has(2));
+      finish(1, true); finish(2, true);
+    }
+    await waitFor(() => pending.has(3) && pending.has(4));
+    const continuing = await queueStatus(exhaustedBook.fingerprint);
+    assert.equal(continuing.failedPages, 2);
+    assert.equal(continuing.nextPage, 3);
+    assert.equal(continuing.status, "running");
+    assert.equal(continuing.retryCount, 6);
+    for (let attempt = 0; attempt < 4; attempt++) {
+      await waitFor(() => pending.has(3));
+      finish(3, true);
+    }
+    await waitFor(async () => (await queueStatus(exhaustedBook.fingerprint)).status === "failed");
+    await waitFor(() => pending.size === 0);
+    const exhausted = await queueStatus(exhaustedBook.fingerprint);
+    assert.equal(exhausted.failedPages, 3);
+    assert.equal(exhausted.retryCount, 9);
+    assert.equal(exhausted.completedPages, 0);
+    assert.equal(exhausted.nextPage, 1);
+    assert.deepEqual(exhausted.pageErrors.map(page => [page.page, page.retryCount, page.status]), [[1, 3, "failed"], [2, 3, "failed"], [3, 3, "failed"]]);
+    const attempted = calls.slice(exhaustedCallsStart);
+    for (const page of [1, 2, 3]) assert.equal(attempted.filter(value => value === page).length, 4);
+    assert.equal(attempted.filter(value => value === 4).length, 1);
+    assert.equal(attempted.includes(5), false);
+
+    // Persist both the independent limit and the stopped/exhausted page records across restart.
+    await configureQueue(10);
+    const exited = new Promise(resolve => serverProcess.once("exit", resolve));
+    serverProcess.kill("SIGKILL"); await exited;
+    serverProcess = spawn(process.execPath, [".next/standalone/server.js"], { cwd: process.cwd(),
+      env: { ...process.env, HOSTNAME: "127.0.0.1", PORT: new URL(baseUrl).port, VERSO_DATA_DIR: testDataDirectory,
+        VERSO_PDF_RENDERER_LOG: rendererLogPath, PATH: `${testDataDirectory}:${process.env.PATH || ""}` }, stdio: ["ignore", "pipe", "pipe"] });
+    await waitFor(async () => { try { return (await fetch(`${baseUrl}/api/books`)).ok; } catch { return false; } });
+    assert.equal((await (await fetch(`${baseUrl}/api/translation-queue`)).json()).settings.concurrency, 10);
+    assert.equal((await queueStatus(exhaustedBook.fingerprint)).retryCount, 9);
+    assert.equal((await queueStatus(exhaustedBook.fingerprint)).failedPages, 3);
+    const recoveredPage = readTestPage(exhaustedBook, 1);
+    await waitFor(() => pending.has(1));
+    finish(1);
+    assert.equal((await recoveredPage).status, 200);
+    const recoveredJob = await queueStatus(exhaustedBook.fingerprint);
+    assert.equal(recoveredJob.failedPages, 2);
+    assert.equal(recoveredJob.retryCount, 6);
+    assert.equal(recoveredJob.status, "failed", "Recovery must not silently resume a paused book");
+    await enqueueTestBook(exhaustedBook);
+    await waitFor(() => pending.size === 4);
+    finish(5); finish(4); finish(3); finish(2);
+    await waitFor(async () => (await queueStatus(exhaustedBook.fingerprint)).status === "completed");
+    assert.equal((await queueStatus(exhaustedBook.fingerprint)).retryCount, 0);
+  } finally {
+    await stop(book);
+    await configureQueue(1);
+    provider.closeAllConnections();
+    await new Promise(resolve => provider.close(resolve));
+  }
+});
+
+test("bounds persisted traces and reads them after a process restart", async () => {
+  const directory = path.join(testDataDirectory, "trace-retention");
+  const run = (source) => new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, ["--input-type=module", "--eval", source], {
+      cwd: process.cwd(), env: { ...process.env, VERSO_DATA_DIR: directory }, stdio: ["ignore", "pipe", "pipe"],
+    });
+    let output = "";
+    child.stderr.on("data", chunk => { output += chunk; });
+    child.once("error", reject);
+    child.once("exit", code => code === 0 ? resolve() : reject(new Error(output)));
+  });
+  await run(`
+    import { withTranslationTrace, traceStep } from './lib/server-translation-trace.ts';
+    for (let page = 1; page <= 205; page++) {
+      await withTranslationTrace({ page }, true, () => traceStep('fixture', async () => page));
+    }
+  `);
+  await run(`
+    import assert from 'node:assert/strict';
+    import { listTranslationTraces } from './lib/server-translation-trace.ts';
+    const traces = await listTranslationTraces();
+    assert.equal(traces.length, 200);
+    assert.ok(traces.every(trace => trace.status === 'ok' && trace.spans[0].durationMs >= 0));
+  `);
+});
+
+test("parses fragmented SSE without splitting Unicode", async () => {
+  const { readEventStream } = await import("../lib/event-stream.ts");
+  const bytes = new TextEncoder().encode(': keep-alive\r\nevent: delta\r\ndata: {"text":\r\ndata: "中文"}\r\n\r\n');
+  const stream = new ReadableStream({ start(controller) { for (const byte of bytes) controller.enqueue(new Uint8Array([byte])); controller.close(); } });
+  const events = [];
+  for await (const event of readEventStream(stream)) events.push(event);
+  assert.deepEqual(events, [{ event: "delta", data: '{"text":\n"中文"}' }]);
+});
+
+test("counts received output independently of chunks and calibrates TPS only with consistent usage", async () => {
+  const { createTranslationStatistics } = await import("../lib/translation-progress.ts");
+  let now = 0;
+  const stats = createTranslationStatistics(() => now);
+  assert.equal(stats.snapshot().tokensPerSecond, undefined);
+  stats.receive("thinking ");
+  now = 2000;
+  stats.receive("中文");
+  stats.receive("\uD83D");
+  stats.receive("\uDE00");
+  const whole = createTranslationStatistics(() => now);
+  whole.receive("thinking 中文😀");
+  assert.equal(stats.snapshot().characters, 12);
+  assert.equal(stats.snapshot().tokens, whole.snapshot().tokens);
+  assert.equal(stats.snapshot().tokensEstimated, true);
+  assert.equal(stats.snapshot().tokensPerSecond, stats.snapshot().tokens / 2);
+  assert.equal(stats.reportUsage({ completion_tokens: 3, completion_tokens_details: { reasoning_tokens: 30 } }), false);
+  assert.equal(stats.snapshot().tokensEstimated, true);
+  assert.equal(stats.reportUsage({ completion_tokens: -1 }), false);
+  assert.equal(stats.reportUsage({ completion_tokens: 12, completion_tokens_details: { reasoning_tokens: 8 } }), true);
+  assert.deepEqual(stats.snapshot(), { characters: 12, tokens: 12, tokensEstimated: false, tokensPerSecond: 6 });
+  assert.equal(stats.reportUsage({ output_tokens: 10, output_tokens_details: { reasoning_tokens: 6 } }), true);
+  assert.equal(stats.snapshot().tokens, 10);
+});
+
+test("rejects interrupted, truncated, refused, and failed provider streams", async () => {
+  const { readProviderStream } = await import("../lib/server-provider-stream.ts");
+  const { readTranslationResponse } = await import("../lib/translation-progress.ts");
+  const handlers = { event() {}, text() {}, reasoning() {} };
+  for (const [responses, events] of [
+    [false, [{ choices: [{ delta: { content: '{"blocks":[]}' } }] }]],
+    [false, [{ choices: [{ delta: {}, finish_reason: "length" }] }, "[DONE]"]],
+    [false, [{ choices: [{ delta: { refusal: "No" } }] }, "[DONE]"]],
+    [true, [{ type: "response.incomplete", response: {} }]],
+    [true, [{ type: "error", message: "secret error detail" }]],
+  ]) {
+    const body = events.map(event => `data: ${typeof event === "string" ? event : JSON.stringify(event)}\n\n`).join("");
+    await assert.rejects(readProviderStream(new Response(body), responses, handlers));
+  }
+  await assert.rejects(readTranslationResponse(new Response('event: progress\ndata: {"phase":"thinking"}\n\n', { headers: { "Content-Type": "text/event-stream" } }), () => {}), /before the result/);
+});
+
+test("streams numeric progress to late readers of background work and saves only complete results", async () => {
+  const { readTranslationResponse } = await import("../lib/translation-progress.ts");
+  const calls = [];
+  let providerResponse;
+  let incoming;
+  const provider = createHttpServer(async (request, response) => {
+    const chunks = [];
+    for await (const chunk of request) chunks.push(chunk);
+    incoming = JSON.parse(Buffer.concat(chunks));
+    calls.push(incoming);
+    providerResponse = response;
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.write(': keep-alive\n\n');
+    response.write(`data: ${JSON.stringify(incoming.input
+      ? { type: "response.reasoning_summary_text.delta", delta: "private reasoning" }
+      : { choices: [{ index: 0, delta: { reasoning_content: "private reasoning" } }] })}\n\n`);
+  });
+  await new Promise(resolve => provider.listen(0, "127.0.0.1", resolve));
+  try {
+    for (const [index, format] of ["compatible", "openai"].entries()) {
+      const book = await uploadQueueBook((index ? "7" : "6").repeat(64), 1);
+      const saved = await fetch(`${baseUrl}/api/settings/ai-provider`, { method: "PUT", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: format, endpoint: `http://127.0.0.1:${provider.address().port}/${index ? "responses" : "v1"}`, apiKey: "stream-secret", model: "stream-model", reasoningEffort: "high" }) });
+      assert.equal(saved.status, 200);
+      providerResponse = undefined;
+      await enqueueTestBook(book);
+      await waitFor(() => providerResponse);
+      assert.equal(incoming.stream, true);
+      if (!index) assert.equal(incoming.stream_options.include_usage, true);
+      const progress = [];
+      const connect = (signal) => fetch(`${baseUrl}/api/translate`, { method: "POST", signal, headers: { "Content-Type": "application/json", Accept: "text/event-stream" },
+        body: JSON.stringify({ bookId: book.fingerprint, page: 1, totalPages: 1, contextPages: [1], targetLanguage: "English", translationConcurrency: 1 }) });
+      const response = await connect();
+      assert.match(response.headers.get("content-type"), /text\/event-stream/);
+      assert.equal(response.headers.get("x-accel-buffering"), "no");
+      let finished = false;
+      const resultPromise = readTranslationResponse(response, value => progress.push(value)).then(value => { finished = true; return value; });
+      await waitFor(() => progress.some(value => value.phase === "thinking"));
+      const partial = '{"page":1,"blocks":[{"kind":"paragraph","text":"实时译文';
+      const delta = content => index ? { type: "response.output_text.delta", delta: content } : { choices: [{ index: 0, delta: { content } }] };
+      providerResponse.write(`data: ${JSON.stringify(delta(partial))}\n\n`);
+      await waitFor(() => progress.some(value => value.phase === "generating" && value.characters === 17 + Array.from(partial).length));
+      assert.equal(finished, false);
+      assert.equal((await queueStatus(book.fingerprint)).completedPages, 0);
+      assert.equal(calls.length, index + 1);
+      // Disconnecting an observer must not cancel the job or another observer.
+      const controller = new AbortController();
+      const second = await connect(controller.signal);
+      const secondProgress = [];
+      const secondResult = readTranslationResponse(second, value => secondProgress.push(value)).catch(() => undefined);
+      await waitFor(() => secondProgress.some(value => value.phase === "generating" && value.characters === 17 + Array.from(partial).length));
+      controller.abort();
+      await secondResult;
+      const tail = '。"}],"previousPageRevision":null}';
+      providerResponse.write(`data: ${JSON.stringify(delta(tail))}\n\n`);
+      const usage = index ? { input_tokens: 123, output_tokens: 45, output_tokens_details: { reasoning_tokens: 12 } }
+        : { prompt_tokens: 123, completion_tokens: 45, completion_tokens_details: { reasoning_tokens: 12 } };
+      providerResponse.end(index ? `data: ${JSON.stringify({ type: "response.completed", response: { status: "completed", usage } })}\n\n`
+        : `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }], usage })}\n\ndata: [DONE]\n\n`);
+      const result = await resultPromise;
+      assert.equal(result.blocks[0].text, "实时译文。");
+      assert.doesNotMatch(JSON.stringify(progress), /private reasoning|实时译文|lastLine/);
+      const aligned = progress.find(value => value.phase === "aligning");
+      assert.equal(aligned.characters, 17 + Array.from(partial + tail).length);
+      assert.equal(aligned.tokens, 45);
+      assert.equal(aligned.tokensEstimated, false);
+      assert.equal(result.trace.attributes.shared, true);
+      await waitFor(async () => (await queueStatus(book.fingerprint)).status === "completed");
+      const { traces } = await (await fetch(`${baseUrl}/api/traces`)).json();
+      const trace = traces.find(value => value.bookId === book.fingerprint && value.background);
+      assert.equal(trace.attributes.streamed, true);
+      assert.equal(trace.attributes.outputTokens, 45);
+      assert.equal(trace.attributes.reasoningTokens, 12);
+      assert.equal(trace.attributes.outputUsageConsistent, true);
+      const span = name => trace.spans.find(value => value.name === name);
+      assert.ok(span("provider.first_text").durationMs > span("provider.wait_headers").durationMs);
+      assert.ok(span("provider.first_event").durationMs <= span("provider.first_text").durationMs);
+      assert.ok(span("provider.first_output").durationMs <= span("provider.first_text").durationMs);
+      assert.ok(span("provider.first_reasoning").durationMs <= span("provider.first_text").durationMs);
+      assert.equal(span("provider.stream").status, "ok");
+      assert.doesNotMatch(JSON.stringify(traces), /private reasoning|stream-secret|实时译文/);
+      const cached = await readTestPage(book, 1);
+      assert.equal((await cached.json()).blocks[0].text, "实时译文。");
+    }
+  } finally {
+    provider.closeAllConnections();
+    await new Promise(resolve => provider.close(resolve));
+  }
+});
+
+test("reports streamed failures without saving a partial translation", async () => {
+  const { readTranslationResponse } = await import("../lib/translation-progress.ts");
+  const provider = createHttpServer(async (request, response) => {
+    for await (const chunk of request) void chunk;
+    response.writeHead(200, { "Content-Type": "text/event-stream" });
+    response.end(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { content: '{"blocks":[{"text":"Partial"}]}' }, finish_reason: "length" }] })}\n\ndata: [DONE]\n\n`);
+  });
+  await new Promise(resolve => provider.listen(0, "127.0.0.1", resolve));
+  try {
+    const book = await uploadQueueBook("9".repeat(64), 1);
+    await fetch(`${baseUrl}/api/settings/ai-provider`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ provider: "compatible", endpoint: `http://127.0.0.1:${provider.address().port}/v1`, apiKey: "fixture", model: "fixture", reasoningEffort: "none" }) });
+    const response = await fetch(`${baseUrl}/api/translate`, { method: "POST", headers: { "Content-Type": "application/json", Accept: "text/event-stream" }, body: JSON.stringify({ bookId: book.fingerprint, page: 1, totalPages: 1, contextPages: [1], targetLanguage: "English" }) });
+    const result = await readTranslationResponse(response, () => {});
+    assert.match(result.error, /length/);
+    assert.equal(result.trace.status, "error");
+    assert.ok(result.trace.spans.some(span => span.name === "provider.stream" && span.status === "error"));
+    const key = translationCacheKey(book.fingerprint, 1, "English");
+    const cached = await (await fetch(`${baseUrl}/api/translations?key=${encodeURIComponent(key)}`)).json();
+    assert.equal(cached.translation, null);
+  } finally {
+    provider.closeAllConnections();
+    await new Promise(resolve => provider.close(resolve));
   }
 });
